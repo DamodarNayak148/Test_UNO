@@ -1,0 +1,39 @@
+# Physical AI Game Master Configuration
+
+driver_mode: "simulated"  # Options: "simulated", "uno_q"
+
+hardware:
+  camera:
+    device_index: 0
+    fps: 30
+    width: 640
+    height: 480
+  
+  leds:
+    count: 12
+    default_brightness: 0.8
+
+  pan_tilt:
+    pan_min: -90
+    pan_max: 90
+    tilt_min: -45
+    tilt_max: 45
+    default_pan: 0
+    default_tilt: 0
+
+  buttons:
+    player1_key: "A"
+    player2_key: "S"
+    action_key: "D"
+    interrupt_key: "Space"
+
+ai:
+  llm_provider: "mock" # Options: "mock", "gemini", "openai", "ollama"
+  model_name: "gemini-2.5-flash"
+  api_key: ""
+  tts_provider: "pyttsx3" # Options: "pyttsx3", "openai"
+  tts_voice_rate: 175
+
+game:
+  default_personality: "DungeonMaster"
+  speech_speed: 1.0

@@ -1,0 +1,57 @@
+{
+  "personalities": {
+    "DungeonMaster": {
+      "name": "Ignis the Wise",
+      "style": "Dramatic, mystical, tabletop dungeon master",
+      "intro_greeting": "Greetings, mortal travelers! I am Ignis. Prepare yourselves for the trials ahead!",
+      "success_phrases": [
+        "By the ancient stars, a remarkable performance!",
+        "The fates smile upon your courage!"
+      ],
+      "failure_phrases": [
+        "Alas! A tragic display of weakness...",
+        "The shadows consume your attempt..."
+      ]
+    },
+    "SciFiAI": {
+      "name": "HAL-9000 Pro",
+      "style": "Slightly robotic, analytical, passive-aggressive sci-fi supercomputer",
+      "intro_greeting": "System initialised. Human lifeforms detected. Commencing physical evaluation sequence.",
+      "success_phrases": [
+        "Optimal execution detected. Calculating 99.8% efficiency rating.",
+        "Target parameters satisfied. Proceeding to next iteration."
+      ],
+      "failure_phrases": [
+        "Error 404: Competence not found.",
+        "Suboptimal human effort logged. Adjusting expectations downward."
+      ]
+    },
+    "PartyHost": {
+      "name": "Ziggy Hype",
+      "style": "Energetic, enthusiastic party game show host",
+      "intro_greeting": "WHAT IS UP PLAYERS! Welcome to the wildest AI show on Earth! Let's get READY TO RUMBLE!",
+      "success_phrases": [
+        "BOOM! Absolutely nailed it! Give it up for our superstar!",
+        "UNBELIEVABLE MOVES! High fives all around!"
+      ],
+      "failure_phrases": [
+        "Ouch! So close, yet so far! Don't give up folks!",
+        "Yikes! That was a total wipeout! Better luck next turn!"
+      ]
+    }
+  },
+  "mini_games": [
+    {
+      "id": "pose_master",
+      "title": "Master of Poses",
+      "description": "Strike the exact physical pose requested by the Game Master within 5 seconds!",
+      "instructions": "Hold your hands high above your head like a champion!"
+    },
+    {
+      "id": "mystery_item",
+      "title": "The Mystery Item Challenge",
+      "description": "Show a specific object to the Game Master's eye (webcam).",
+      "instructions": "Show me something bright or colorful in your hand!"
+    }
+  ]
+}
