@@ -45,13 +45,21 @@
       "id": "pose_master",
       "title": "Master of Poses",
       "description": "Strike the exact physical pose requested by the Game Master within 5 seconds!",
-      "instructions": "Hold your hands high above your head like a champion!"
+      "instructions": "Hold your hands high above your head like a champion!",
+      "evaluation_criteria": {
+        "require_face": true,
+        "required_telemetry": ["hands_raised"]
+      }
     },
     {
       "id": "mystery_item",
       "title": "The Mystery Item Challenge",
       "description": "Show a specific object to the Game Master's eye (webcam).",
-      "instructions": "Show me something bright or colorful in your hand!"
+      "instructions": "Show me something bright or colorful in your hand!",
+      "evaluation_criteria": {
+        "require_face": false,
+        "required_telemetry": ["has_colorful_item"]
+      }
     }
   ]
 }

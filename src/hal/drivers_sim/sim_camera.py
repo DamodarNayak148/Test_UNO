@@ -1,4 +1,5 @@
 import cv2
+import threading
 import numpy as np
 import time
 from typing import Optional
@@ -15,6 +16,7 @@ class SimCamera(BaseCamera):
         self.cap: Optional[cv2.VideoCapture] = None
         self._running = False
         self._synthetic_angle = 0.0
+        self._lock = threading.Lock()  # Protects concurrent get_frame() calls
 
     def start_stream(self) -> bool:
         try:
@@ -38,16 +40,17 @@ class SimCamera(BaseCamera):
         self.cap = None
 
     def get_frame(self) -> Optional[np.ndarray]:
-        if not self._running:
-            return None
+        with self._lock:
+            if not self._running:
+                return None
 
-        if self.cap and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
-                return frame
+            if self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    return frame
 
-        # Fallback: Synthetic animated camera frame
-        return self._generate_synthetic_frame()
+            # Fallback: Synthetic animated camera frame
+            return self._generate_synthetic_frame()
 
     def is_opened(self) -> bool:
         return self._running

@@ -10,17 +10,19 @@ class LLMService:
         self.api_key = api_key
         self.model_name = model_name
 
-    def generate_gm_response(self, personality: Dict[str, Any], context: str, vision_telemetry: Dict[str, Any]) -> str:
-        """Generate GM commentary based on personality, game context, and vision telemetry."""
+    def generate_gm_response(self, personality: Dict[str, Any], context: str, vision_telemetry: Dict[str, Any], success: bool = True) -> str:
+        """Generate GM commentary based on personality, game context, vision telemetry, and evaluated success result."""
         if self.provider == "gemini" and self.api_key:
             try:
                 from google import genai
                 client = genai.Client(api_key=self.api_key)
+                outcome_str = "SUCCESS" if success else "FAILURE"
                 prompt = (
                     f"You are {personality.get('name')}, a game master with personality style '{personality.get('style')}'.\n"
                     f"Game Context: {context}\n"
+                    f"Outcome: {outcome_str}\n"
                     f"Vision Telemetry: {json.dumps(vision_telemetry)}\n"
-                    f"Respond in 1-2 dramatic sentences as the Game Master!"
+                    f"Respond in 1-2 dramatic sentences as the Game Master for this {outcome_str}!"
                 )
                 response = client.models.generate_content(
                     model=self.model_name,
@@ -32,13 +34,10 @@ class LLMService:
                 print(f"[LLMService] Gemini call failed: {e}. Falling back to mock engine.")
 
         # Default Mock LLM engine (Deterministic & responsive for testing)
-        return self._generate_mock_response(personality, context, vision_telemetry)
+        return self._generate_mock_response(personality, context, vision_telemetry, success)
 
-    def _generate_mock_response(self, personality: Dict[str, Any], context: str, vision_telemetry: Dict[str, Any]) -> str:
+    def _generate_mock_response(self, personality: Dict[str, Any], context: str, vision_telemetry: Dict[str, Any], success: bool) -> str:
         name = personality.get("name", "Game Master")
-        style = personality.get("style", "")
-        
-        success = vision_telemetry.get("hands_raised", False) or vision_telemetry.get("has_colorful_item", False) or vision_telemetry.get("face_detected", False)
 
         if "pose" in context.lower():
             if success:
@@ -48,13 +47,17 @@ class LLMService:
                 phrases = personality.get("failure_phrases", ["What kind of pose was that? Fails miserably!"])
                 return f"{name}: {random.choice(phrases)}"
         elif "item" in context.lower():
-            if vision_telemetry.get("has_colorful_item", False):
-                return f"{name}: Ah! I see the vibrant artifact in your hand! A worthy offering!"
+            if success:
+                phrases = personality.get("success_phrases", ["Ah! A vibrant artifact in your hand! A worthy offering!"])
+                return f"{name}: {random.choice(phrases)}"
             else:
-                return f"{name}: I see nothing worthy in front of my lens! Try presenting something brighter!"
+                phrases = personality.get("failure_phrases", ["I see nothing worthy in front of my lens! Try presenting something brighter!"])
+                return f"{name}: {random.choice(phrases)}"
         
         # General dialogue
         if success:
-            return f"{name}: Excellent action! My physical sensors approve of your maneuver!"
+            phrases = personality.get("success_phrases", ["Excellent action! My physical sensors approve of your maneuver!"])
+            return f"{name}: {random.choice(phrases)}"
         else:
-            return f"{name}: Hmmm... an unexpected outcome. The Game Master remains unimpressed!"
+            phrases = personality.get("failure_phrases", ["Hmmm... an unexpected outcome. The Game Master remains unimpressed!"])
+            return f"{name}: {random.choice(phrases)}"

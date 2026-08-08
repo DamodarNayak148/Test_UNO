@@ -41,13 +41,6 @@ class SimAudio(BaseAudio):
         return self._is_speaking
 
     def _speech_worker(self) -> None:
-        engine = None
-        try:
-            engine = pyttsx3.init()
-            engine.setProperty('rate', self.voice_rate)
-        except Exception as e:
-            print(f"[SimAudio] Pyttsx3 init warning: {e}")
-
         while not self._stop_event.is_set():
             try:
                 item = self.speech_queue.get(timeout=0.2)
@@ -59,17 +52,22 @@ class SimAudio(BaseAudio):
                 if self._on_speech_state_change:
                     self._on_speech_state_change(True, text)
 
-                if engine:
-                    try:
-                        engine.say(text)
-                        engine.runAndWait()
-                    except Exception as e:
-                        print(f"[SimAudio Engine Error]: {e}")
-                        # Fallback simulated delay
-                        time.sleep(len(text) * 0.05)
-                else:
-                    # Simulated TTS delay if engine unavailable
+                engine = None
+                try:
+                    engine = pyttsx3.init()
+                    engine.setProperty('rate', self.voice_rate)
+                    engine.say(text)
+                    engine.runAndWait()
+                    engine.stop()
+                except Exception as e:
+                    print(f"[SimAudio Engine Error]: {e}")
                     time.sleep(len(text) * 0.05)
+                finally:
+                    if engine:
+                        try:
+                            del engine
+                        except Exception:
+                            pass
 
                 self._is_speaking = False
                 if self._on_speech_state_change:

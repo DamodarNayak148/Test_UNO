@@ -1,11 +1,14 @@
 import time
 import threading
+import numpy as np
 from typing import Callable, Optional, Dict, Any
 from src.hal.hardware_factory import HardwareSuite
 from src.engine.game_state import GameState
 from src.engine.prompt_manager import PromptManager
+from src.engine.vision_scan import VisionScanSession, VisionScanResult
 from src.ai.vision_processor import VisionProcessor
 from src.ai.llm_service import LLMService
+
 
 class GameMaster:
     """Core Game Master Engine connecting HAL drivers, AI vision/LLM, and game state logic."""
@@ -22,6 +25,10 @@ class GameMaster:
         self.current_player: str = "Player 1"
 
         self._on_state_change_cb: Optional[Callable[[GameState, str], None]] = None
+
+        # Active scan session — used to interrupt a running scan on emergency interrupt
+        self._active_scan: Optional[VisionScanSession] = None
+        self._scan_lock = threading.Lock()
 
         # Register physical/simulated button listeners
         self.hw.buttons.register_callback("player1", lambda: self.handle_player_button("Player 1"))
@@ -88,7 +95,7 @@ class GameMaster:
         self.hw.audio.play_sfx("scanning")
 
         # Non-blocking vision evaluation sequence
-        threading.Thread(target=self._process_vision_scan, daemon=True).start()
+        threading.Thread(target=self._run_vision_scan, daemon=True, name="GameMasterScanThread").start()
 
     def handle_action_button(self) -> None:
         if self.state == GameState.IDLE:
@@ -99,27 +106,92 @@ class GameMaster:
     def handle_interrupt_button(self) -> None:
         print("[GameMaster] Emergency Interrupt Triggered!")
         self.hw.audio.stop_speaking()
+
+        # Interrupt any active scan session so it exits quickly
+        with self._scan_lock:
+            if self._active_scan is not None:
+                self._active_scan.interrupt()
+                self._active_scan = None
+
         self.state = GameState.IDLE
         self.hw.led.clear()
         self.hw.pan_tilt.center()
         self.hw.pan_tilt.set_expression("neutral")
         self._notify_state("Game interrupted and reset to IDLE.")
 
-    def _process_vision_scan(self) -> None:
-        time.sleep(1.2) # Allow camera capture window
-        frame = self.hw.camera.get_frame()
-        _, telemetry = self.vision.analyze_frame(frame)
+    # ------------------------------------------------------------------
+    # Vision scan — fully delegated to VisionScanSession
+    # ------------------------------------------------------------------
+
+    def _run_vision_scan(self) -> None:
+        """
+        Runs in a background daemon thread.
+        Delegates entirely to VisionScanSession.
+        Always transitions out of SCANNING_VISION, even on error.
+        """
+        interrupt_event = threading.Event()
+        session = VisionScanSession(
+            camera=self.hw.camera,
+            vision_processor=self.vision,
+            interrupt_event=interrupt_event,
+        )
+
+        # Register this session so handle_interrupt_button() can abort it
+        with self._scan_lock:
+            self._active_scan = session
+
+        try:
+            session.start()
+            result: VisionScanResult = session.wait(timeout=12.0)
+        except Exception as exc:
+            print(f"[GameMaster] Vision scan wrapper error: {exc}")
+            result = VisionScanResult.failure(reason=str(exc))
+        finally:
+            with self._scan_lock:
+                self._active_scan = None
+
+        # If the interrupt was fired we must NOT overwrite the IDLE state
+        if result.was_interrupted or self.state == GameState.IDLE:
+            print("[GameMaster] Scan was interrupted — skipping evaluation.")
+            return
+
+        self._evaluate_and_react(result)
+
+    # ------------------------------------------------------------------
+    # Challenge evaluation — unchanged logic, cleaner signature
+    # ------------------------------------------------------------------
+
+    def _evaluate_and_react(self, result: VisionScanResult) -> None:
+        """Evaluate the scan result against challenge criteria and trigger reaction."""
+        telemetry = result.as_telemetry()
 
         self.state = GameState.EVALUATING
-        self._notify_state(f"Evaluating telemetry: {telemetry}")
+        self._notify_state(
+            f"Evaluating: hands={result.hands_raised} ({result.hands_confirmations}/{result.valid_frames}) "
+            f"face={result.face_detected} color={result.has_colorful_item}"
+        )
 
-        # Query LLM for Game Master response
+        # Evaluate challenge-specific criteria (Single Source of Truth)
         game = self.prompt_mgr.get_mini_game(self.current_game_index)
-        context = f"Game: {game.get('title')}. Player: {self.current_player} performed action."
-        ai_commentary = self.llm.generate_gm_response(self.active_personality, context, telemetry)
+        criteria = game.get("evaluation_criteria", {})
+        require_face = criteria.get("require_face", False)
+        required_telemetry = criteria.get("required_telemetry", [])
 
-        # Determine success status
-        success = telemetry.get("hands_raised", False) or telemetry.get("has_colorful_item", False) or telemetry.get("face_detected", False)
+        success = True
+        if require_face and not telemetry.get("face_detected", False):
+            success = False
+
+        for req in required_telemetry:
+            if not telemetry.get(req, False):
+                success = False
+                break
+
+        if not criteria:
+            success = telemetry.get("hands_raised", False) or telemetry.get("has_colorful_item", False)
+
+        # Query LLM for Game Master response using evaluated success status
+        context = f"Game: {game.get('title')}. Player: {self.current_player} performed action."
+        ai_commentary = self.llm.generate_gm_response(self.active_personality, context, telemetry, success=success)
 
         self._execute_reaction(ai_commentary, success)
 
