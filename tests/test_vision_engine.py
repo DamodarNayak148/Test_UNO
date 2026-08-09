@@ -9,8 +9,9 @@ Tests cover:
   5. Smile detection & eyebrow elevation
   6. Expression classification (NEUTRAL, SMILE, SURPRISED, ANGRY, SAD)
   7. YuNet face detector initialization & extraction (bbox, confidence, 5 keypoints)
-  8. VisionResult dataclasses & structure
-  9. VisionEngine frame processing & temporal smoothers
+  8. Trained AI Expression Model (HSEmotionONNX) crop inference & probabilities
+  9. VisionResult dataclasses & structure
+  10. VisionEngine frame processing & temporal smoothers
 
 Run:
     python -m pytest tests/test_vision_engine.py -v
@@ -304,7 +305,7 @@ class TestExpressionClassification:
 
 
 # ===========================================================================
-# 6. YuNet Face Detector Tests (Task 13 requirements)
+# 6. YuNet Face Detector Tests
 # ===========================================================================
 
 class TestYuNetFaceDetector:
@@ -339,7 +340,40 @@ class TestYuNetFaceDetector:
 
 
 # ===========================================================================
-# 7. VisionResult Structure Tests
+# 7. Trained AI Expression Model (HSEmotionONNX) Tests
+# ===========================================================================
+
+class TestTrainedAIExpressionModel:
+
+    @pytest.fixture(scope="class")
+    def engine(self):
+        from src.vision.vision_engine import VisionEngine
+        return VisionEngine()
+
+    def test_ai_expression_model_initialization(self, engine):
+        assert engine._expression_ai_model is not None, "HSEmotion trained AI expression model should be initialized"
+
+    def test_ai_expression_invalid_crop_handling(self, engine):
+        img = np.ones((480, 640, 3), dtype=np.uint8) * 128
+        # Invalid bbox (too small / 0 size)
+        expr, conf, probs = engine._run_expression_ai(img, (0, 0, 10, 10))
+        assert expr == "Neutral"
+        assert conf == 0.0
+        assert probs == {}
+
+    def test_ai_expression_inference_synthetic_crop(self, engine):
+        img = np.ones((480, 640, 3), dtype=np.uint8) * 128
+        # Synthetic bbox (100, 100, 200, 200)
+        expr, conf, probs = engine._run_expression_ai(img, (100, 100, 200, 200))
+        assert isinstance(expr, str)
+        assert len(expr) > 0
+        assert 0.0 <= conf <= 1.0
+        assert isinstance(probs, dict)
+        assert len(probs) == 8  # 8 emotion classes
+
+
+# ===========================================================================
+# 8. VisionResult Structure Tests
 # ===========================================================================
 
 class TestVisionResultStructure:
@@ -354,18 +388,16 @@ class TestVisionResultStructure:
         assert isinstance(vr.right_hand, HandResult)
         assert isinstance(vr.pose, PoseResult)
 
-        # YuNet & Face fields
-        assert hasattr(vr.face, "keypoints")
-        assert hasattr(vr.face, "confidence")
-        assert hasattr(vr.face, "detector_source")
-        assert hasattr(vr.face, "mouth_open")
-        assert hasattr(vr.face, "smile")
-        assert hasattr(vr.face, "eyebrows_raised")
+        # Expression comparison fields
+        assert hasattr(vr.face, "heuristic_expression")
+        assert hasattr(vr.face, "ai_expression")
+        assert hasattr(vr.face, "ai_confidence")
+        assert hasattr(vr.face, "ai_expression_probabilities")
         assert hasattr(vr.face, "expression")
 
 
 # ===========================================================================
-# 8. VisionEngine Execution Tests
+# 9. VisionEngine Execution Tests
 # ===========================================================================
 
 class TestVisionEngineExecution:

@@ -20,10 +20,10 @@ from typing import Dict, List, Optional, Tuple, Any
 class FaceResult:
     """
     Face detection and perception result.
-    Primary face detector: YuNet (cv2.FaceDetectorYN) for high-accuracy bounding boxes,
-    confidence scores, and 5 keypoints.
-    Primary face mesh landmarker: MediaPipe FaceLandmarker (478 landmarks) for eyelids,
-    iris, EAR, MAR, smile, eyebrow elevation, and expression.
+    Detectors:
+      - YuNet (cv2.FaceDetectorYN) for high-accuracy bounding boxes, scores, & 5 keypoints.
+      - MediaPipe FaceLandmarker (478 landmarks) for eyelids, iris, EAR, MAR, smile, & eyebrows.
+      - HSEmotionONNX (Trained AI Model) for deep learning facial expression recognition & probabilities.
     """
     detected: bool = False
     count: int = 0
@@ -57,7 +57,17 @@ class FaceResult:
     mouth_ar: float = 0.0             # Mouth Aspect Ratio
     smile: bool = False
     eyebrows_raised: bool = False
-    expression: str = "NEUTRAL"       # "NEUTRAL" | "SMILE" | "SURPRISED" | "ANGRY" | "SAD"
+
+    # Heuristic landmark-based expression classifier
+    heuristic_expression: str = "NEUTRAL"
+
+    # Trained Deep Learning AI Expression Model (HSEmotionONNX)
+    ai_expression: str = "Neutral"
+    ai_confidence: float = 0.0
+    ai_expression_probabilities: Dict[str, float] = field(default_factory=dict)
+
+    # Backward compatibility alias (set to heuristic_expression or ai_expression)
+    expression: str = "NEUTRAL"
     detector_source: str = "YuNet"    # "YuNet" | "MediaPipe" | "Haar"
 
 

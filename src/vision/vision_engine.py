@@ -7,16 +7,19 @@ Runs all detectors on every camera frame and returns:
 
 Detector pipeline (each isolated -- one crash never halts the others):
   1. Brightness guard         -- dark/covered-camera early exit
-  2. Face Detector (YuNet + MediaPipe):
+  2. Face Detector (YuNet + MediaPipe + HSEmotionONNX AI):
      + YuNet (cv2.FaceDetectorYN) deep ONNX face detector for high accuracy,
        zero background false-positives, confidence scores, and 5 keypoints
      + MediaPipe FaceLandmarker for 478-landmark face mesh + iris centres
      + Eye Aspect Ratio (EAR) open/closed detection
      + State-machine Blink detection
      + Facial configuration & expression recognition (Smile, Mouth Open, Eyebrows)
+     + HSEmotionONNX Trained Deep Learning AI Expression Model (EfficientNet-B0 ONNX)
+       providing 8-class facial expression probabilities & EMA temporal smoothing
   3. Eye landmarks            -- derived from face mesh (iris 468/473, EAR contours)
   4. MediaPipe HandLandmarker -- 21-landmark hand model, left + right
-  5. Finger detection         -- 3D orientation-invariant landmark geometry (Thumb & Fingers 1-4)
+  5. Finger detection         -- 3D orientation-invariant landmark geometry + temporal smoothing
+                                 for rock-solid, jitter-free Thumb & Fingers 1-4
   6. MediaPipe PoseLandmarker -- 33-landmark body skeleton + pose classification
 
 Architecture preserved:
@@ -90,6 +93,12 @@ _YUNET_MODEL_URL = (
     "face_detection_yunet/face_detection_yunet_2023mar.onnx"
 )
 _YUNET_MODEL_PATH = "models/face_detection_yunet_2023mar.onnx"
+
+_HSEMOTION_MODEL_URL = (
+    "https://github.com/HSE-asavchenko/face-emotion-recognition/blob/main/"
+    "models/affectnet_emotions/onnx/enet_b0_8_best_vgaf.onnx?raw=true"
+)
+_HSEMOTION_MODEL_PATH = "models/enet_b0_8_best_vgaf.onnx"
 
 _POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
@@ -190,7 +199,8 @@ _FACE_R_SIDE  = 454
 
 class DetectionHistory:
     """
-    Rolling-window boolean smoother for detector on/off flickering.
+    Rolling-window boolean smoother with configurable hysteresis for detector
+    or per-finger on/off state stabilization.
     """
 
     def __init__(self, window: int = 5, min_hits: int = 2) -> None:
@@ -198,12 +208,12 @@ class DetectionHistory:
         self._min_hits = min_hits
 
     def push(self, detected: bool) -> bool:
-        """Record this frame's detection state; return smoothed bool."""
+        """Record this frame's state; return smoothed bool."""
         self._history.append(detected)
         return int(sum(self._history)) >= self._min_hits
 
     def reset(self) -> None:
-        """Clear history (e.g. when camera stream restarts)."""
+        """Clear history (e.g. when detection drops out)."""
         for i in range(len(self._history)):
             self._history[i] = False
 
@@ -238,11 +248,15 @@ class VisionEngine:
         self._frame_times: List[float] = []
         self._fps_window = 30
 
-        # ---- Temporal smoothers (5-frame window, 2-hit threshold) ----
+        # ---- Temporal smoothers ----
         self._face_smoother = DetectionHistory(window=5, min_hits=2)
         self._lh_smoother   = DetectionHistory(window=5, min_hits=2)
         self._rh_smoother   = DetectionHistory(window=5, min_hits=2)
         self._pose_smoother = DetectionHistory(window=5, min_hits=2)
+
+        # Per-finger hysteresis smoothers (window=4, min_hits=2) for Left & Right hands
+        self._lh_finger_smoothers = [DetectionHistory(window=4, min_hits=2) for _ in range(5)]
+        self._rh_finger_smoothers = [DetectionHistory(window=4, min_hits=2) for _ in range(5)]
 
         # ---- Blink state machine tracking ----
         self._blink_count: int = 0
@@ -255,6 +269,12 @@ class VisionEngine:
         # YuNet ONNX Face Detector (Primary detection engine)
         self._yunet_detector: Any = None
         self._init_yunet()
+
+        # Trained Deep Learning Facial Expression AI Model (HSEmotionONNX)
+        self._expression_ai_model: Any = None
+        self._ai_prob_history: Dict[str, float] = {}
+        self._ai_inference_ms: float = 0.0
+        self._init_ai_expression_model()
 
         # Haar (kept loaded as standby fallback)
         self._face_cascade: Optional[cv2.CascadeClassifier] = None
@@ -275,17 +295,11 @@ class VisionEngine:
     # ------------------------------------------------------------------
 
     def _init_yunet(self) -> None:
-        """
-        Initialise YuNet face detector (cv2.FaceDetectorYN).
-        YuNet is a lightweight deep learning ONNX face detector from OpenCV Zoo.
-        Provides high-accuracy multi-face detection, bounding boxes, score thresholds,
-        NMS duplicate filtering, and 5 2D keypoints (eyes, nose, mouth corners).
-        """
+        """Initialise YuNet face detector (cv2.FaceDetectorYN)."""
         if not hasattr(cv2, "FaceDetectorYN"):
             print("[VisionEngine] cv2.FaceDetectorYN not available.")
             return
         try:
-            # Use project-relative path so running from any CWD works cleanly
             model_path = os.path.abspath(
                 os.path.join(os.path.dirname(__file__), "..", "..", _YUNET_MODEL_PATH)
             )
@@ -305,6 +319,29 @@ class VisionEngine:
             print("[VisionEngine] YuNet face detector initialized.")
         except Exception as e:
             print(f"[VisionEngine] YuNet init warning: {e}")
+
+    def _init_ai_expression_model(self) -> None:
+        """
+        Initialise HSEmotionONNX trained facial-expression AI model.
+        Pretrained EfficientNet-B0 ONNX model providing 8-class expression probabilities:
+        (Anger, Contempt, Disgust, Fear, Happiness, Neutral, Sadness, Surprise).
+        Runs 100% offline & locally on CPU.
+        """
+        try:
+            import urllib.request
+            model_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", _HSEMOTION_MODEL_PATH)
+            )
+            if not os.path.exists(model_path):
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                print(f"[VisionEngine] Downloading HSEmotion ONNX model -> {model_path} ...")
+                urllib.request.urlretrieve(_HSEMOTION_MODEL_URL, model_path)
+
+            from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
+            self._expression_ai_model = HSEmotionRecognizer(model_name='enet_b0_8_best_vgaf')
+            print("[VisionEngine] HSEmotion Trained Expression AI model initialized.")
+        except Exception as e:
+            print(f"[VisionEngine] Expression AI init warning: {e}")
 
     def _init_haar(self) -> None:
         """Load Haar cascades (kept as fallback; not active in main loop)."""
@@ -475,12 +512,6 @@ class VisionEngine:
     ) -> Tuple[np.ndarray, VisionResult]:
         """
         Process one BGR camera frame.
-
-        Returns:
-            annotated -- BGR frame with all overlays drawn (safe to display)
-            result    -- VisionResult with all detection data
-
-        Never raises. Returns a blank frame on any error.
         """
         fps = self._update_fps()
 
@@ -519,10 +550,19 @@ class VisionEngine:
         rh.detected          = self._rh_smoother.push(rh.detected)
         pose_result.detected = self._pose_smoother.push(pose_result.detected)
 
-        # Eyes are derived from face -- clear if face not smoothed-active
+        # Reset smoothers if detection drops out
         if not face_result.detected:
             eye_result = EyeResult(blink_count=self._blink_count)
             self._closed_frames = 0
+            self._ai_prob_history = {}
+
+        if not lh.detected:
+            for s in self._lh_finger_smoothers:
+                s.reset()
+
+        if not rh.detected:
+            for s in self._rh_finger_smoothers:
+                s.reset()
 
         # ---------- FPS overlay ----------
         self._draw_fps(annotated, fps)
@@ -541,6 +581,68 @@ class VisionEngine:
         return annotated, result
 
     # ------------------------------------------------------------------
+    # Expression AI Model Inference (HSEmotionONNX)
+    # ------------------------------------------------------------------
+
+    def _run_expression_ai(
+        self, original: np.ndarray, bbox: Tuple[int, int, int, int]
+    ) -> Tuple[str, float, Dict[str, float]]:
+        """
+        Extract face crop from bbox, preprocess for HSEmotion model (224x224 RGB),
+        run inference, apply EMA temporal probability smoothing (3-5 frames),
+        and return (top_class, top_confidence, probabilities_dict).
+        100% offline & local computation.
+        """
+        if self._expression_ai_model is None:
+            return "N/A", 0.0, {}
+
+        try:
+            img_h, img_w = original.shape[:2]
+            bx, by, bw, bh = bbox
+
+            # Safe clip to image boundaries
+            x1, y1 = max(0, bx), max(0, by)
+            x2, y2 = min(img_w, bx + bw), min(img_h, by + bh)
+
+            if (y2 - y1) < 20 or (x2 - x1) < 20:
+                return "Neutral", 0.0, {}
+
+            crop_bgr = original[y1:y2, x1:x2]
+            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+
+            start_t = time.perf_counter()
+            _, raw_scores = self._expression_ai_model.predict_emotions(crop_rgb, logits=False)
+            self._ai_inference_ms = (time.perf_counter() - start_t) * 1000.0
+
+            classes = self._expression_ai_model.idx_to_class
+            raw_probs = {classes[i]: float(raw_scores[i]) for i in range(len(raw_scores))}
+
+            # EMA Temporal Smoothing (alpha=0.4 ~ 3-5 frame window)
+            alpha = 0.4
+            if not self._ai_prob_history:
+                self._ai_prob_history = raw_probs
+            else:
+                for cat, val in raw_probs.items():
+                    prev_val = self._ai_prob_history.get(cat, val)
+                    self._ai_prob_history[cat] = alpha * val + (1.0 - alpha) * prev_val
+
+            # Normalize smoothed probabilities
+            total_prob = sum(self._ai_prob_history.values())
+            if total_prob > 1e-6:
+                probs = {k: float(v / total_prob) for k, v in self._ai_prob_history.items()}
+            else:
+                probs = raw_probs
+
+            top_class = max(probs, key=probs.get)
+            top_conf  = probs[top_class]
+
+            return top_class, float(top_conf), probs
+
+        except Exception as e:
+            print(f"[VisionEngine] Expression AI inference error: {e}")
+            return "Neutral", 0.0, {}
+
+    # ------------------------------------------------------------------
     # YuNet Face Detector (cv2.FaceDetectorYN)
     # ------------------------------------------------------------------
 
@@ -549,7 +651,6 @@ class VisionEngine:
     ) -> Dict[str, Any]:
         """
         Run YuNet deep learning face detector (cv2.FaceDetectorYN).
-        Returns dict with detected, count, bounding_boxes, confidences, keypoints, center.
         """
         if self._yunet_detector is None:
             return {"detected": False, "count": 0, "bounding_boxes": [], "confidences": [], "keypoints": [], "center": (0,0)}
@@ -581,12 +682,10 @@ class VisionEngine:
                 ]
                 all_keypoints.append(kpts)
 
-                # Draw YuNet bounding box & keypoints on annotated frame
                 is_primary = (bx, by, bw, bh) == boxes[0]
                 col = _COL_FACE_BOX if is_primary else (80, 180, 80)
                 cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), col, 2)
 
-                # Draw 5 YuNet keypoint dots (cyan/yellow)
                 for kp in kpts:
                     cv2.circle(annotated, kp, 3, (255, 255, 0), -1)
 
@@ -613,7 +712,7 @@ class VisionEngine:
             return {"detected": False, "count": 0, "bounding_boxes": [], "confidences": [], "keypoints": [], "center": (0,0)}
 
     # ------------------------------------------------------------------
-    # Multi-Stage Face perception pipeline (YuNet + MediaPipe Landmarker)
+    # Multi-Stage Face perception pipeline (YuNet + MediaPipe + Expression AI)
     # ------------------------------------------------------------------
 
     def _detect_faces_mp(
@@ -622,8 +721,8 @@ class VisionEngine:
         """
         Multi-stage face perception pipeline:
           1. YuNet (cv2.FaceDetectorYN) for high-accuracy bounding boxes, scores, and 5 keypoints.
-          2. MediaPipe FaceLandmarker for 478 3D landmarks, EAR, MAR, smile, eyebrows, expression.
-          3. Haar cascade fallback if neither neural detector is available.
+          2. MediaPipe FaceLandmarker for 478 3D landmarks, EAR, MAR, smile, eyebrows, heuristic expression.
+          3. HSEmotionONNX Trained AI Expression Model for 8-class deep emotion probabilities & confidence.
         """
         yn_res = self._detect_faces_yunet(annotated, original)
 
@@ -637,9 +736,22 @@ class VisionEngine:
                 face_res.keypoints = yn_res["keypoints"]
                 face_res.confidence = yn_res["confidences"][0] if yn_res["confidences"] else 1.0
                 face_res.detector_source = "YuNet"
+
+            # Run Trained Expression AI Model on primary face crop if detected
+            if face_res.detected and face_res.bounding_boxes:
+                primary_bbox = face_res.bounding_boxes[0]
+                ai_expr, ai_conf, ai_probs = self._run_expression_ai(original, primary_bbox)
+
+                face_res.heuristic_expression = face_res.expression
+                face_res.ai_expression = ai_expr
+                face_res.ai_confidence = ai_conf
+                face_res.ai_expression_probabilities = ai_probs
+
             return face_res, eye_res
 
         if yn_res["detected"]:
+            primary_bbox = yn_res["bounding_boxes"][0]
+            ai_expr, ai_conf, ai_probs = self._run_expression_ai(original, primary_bbox)
             return FaceResult(
                 detected=True,
                 count=yn_res["count"],
@@ -648,6 +760,11 @@ class VisionEngine:
                 confidence=yn_res["confidences"][0] if yn_res["confidences"] else 0.9,
                 keypoints=yn_res["keypoints"],
                 nose_tip=yn_res["keypoints"][2] if len(yn_res["keypoints"]) > 2 else None,
+                heuristic_expression="NEUTRAL",
+                ai_expression=ai_expr,
+                ai_confidence=ai_conf,
+                ai_expression_probabilities=ai_probs,
+                expression="NEUTRAL",
                 detector_source="YuNet",
             ), EyeResult(blink_count=self._blink_count)
 
@@ -761,6 +878,7 @@ class VisionEngine:
                 mouth_ar=primary["mouth_ar"],
                 smile=primary["smile"],
                 eyebrows_raised=primary["eyebrows_raised"],
+                heuristic_expression=primary["expression"],
                 expression=primary["expression"],
                 detector_source="MediaPipe",
             )
@@ -1068,7 +1186,7 @@ class VisionEngine:
         label: str,
         confidence: float,
     ) -> HandResult:
-        """Compute pixel positions, 3D finger states, and draw for one hand."""
+        """Compute pixel positions, 3D finger states with temporal smoothing, and draw for one hand."""
         pixels: List[Tuple[int, int]] = [
             (int(lm.x * w), int(lm.y * h)) for lm in landmarks
         ]
@@ -1084,9 +1202,15 @@ class VisionEngine:
         else:
             center = wrist
 
-        finger_states = self._compute_finger_states(landmarks, label)
-        fingers_up    = sum(finger_states)
-        fingers_dict  = {name: state for name, state in zip(_FINGER_NAMES, finger_states)}
+        # Compute raw finger states
+        raw_finger_states = self._compute_finger_states(landmarks, label)
+
+        # Apply per-finger hysteresis smoothers (window=4, min_hits=2)
+        smoothers = self._lh_finger_smoothers if label == "Left" else self._rh_finger_smoothers
+        finger_states = [s.push(raw) for s, raw in zip(smoothers, raw_finger_states)]
+
+        fingers_up   = sum(finger_states)
+        fingers_dict = {name: state for name, state in zip(_FINGER_NAMES, finger_states)}
 
         colour = _COL_HAND_L if label == "Left" else _COL_HAND_R
         self._draw_hand(annotated, pixels, finger_states, colour, label)
@@ -1108,7 +1232,8 @@ class VisionEngine:
         self, landmarks: Any, handedness: str
     ) -> List[bool]:
         """
-        Determine which of the 5 fingers are extended using 3D vector geometry.
+        Determine which of the 5 fingers are extended using 3D vector geometry
+        and handedness normalization.
         """
         states = [False] * 5
 
@@ -1133,6 +1258,7 @@ class VisionEngine:
             finger_tips = [8, 12, 16, 20]
             threshold = 0.04 * pd_len
 
+            # Fingers 1-4 (Index, Middle, Ring, Pinky)
             for i, (mcp_i, tip_i) in enumerate(zip(finger_mcps, finger_tips)):
                 mcp = landmarks[mcp_i]
                 tip = landmarks[tip_i]
@@ -1142,33 +1268,30 @@ class VisionEngine:
                 proj = vx * palm_dir[0] + vy * palm_dir[1] + vz * palm_dir[2]
                 states[i + 1] = proj > threshold
 
-            # --- Improved Thumb Extension Detection ---
+            # --- Rock-Solid Orientation-Invariant & Handedness-Aware Thumb Geometry ---
             thumb_cmc = landmarks[1]
             thumb_mcp = landmarks[2]
             thumb_ip  = landmarks[3]
             thumb_tip = landmarks[4]
 
-            d_tip_pinky = self._dist_3d(thumb_tip, pinky_mcp)
-            d_tip_idx   = self._dist_3d(thumb_tip, idx_mcp)
-            d_cmc_idx   = self._dist_3d(thumb_cmc, idx_mcp)
+            # 1. 3D Joint Angle at IP Joint (cos theta of IP->MCP and IP->TIP)
+            va = (thumb_mcp.x - thumb_ip.x, thumb_mcp.y - thumb_ip.y, thumb_mcp.z - thumb_ip.z)
+            vb = (thumb_tip.x - thumb_ip.x, thumb_tip.y - thumb_ip.y, thumb_tip.z - thumb_ip.z)
+            len_a = math.sqrt(va[0]**2 + va[1]**2 + va[2]**2)
+            len_b = math.sqrt(vb[0]**2 + vb[1]**2 + vb[2]**2)
+            cos_ip = 0.0
+            if len_a > 1e-6 and len_b > 1e-6:
+                cos_ip = (va[0]*vb[0] + va[1]*vb[1] + va[2]*vb[2]) / (len_a * len_b)
 
-            ratio_pinky = d_tip_pinky / pd_len
-            ratio_idx   = d_tip_idx / pd_len
+            # 2. 3D Abduction Distance Ratios
+            d_tip_idx   = self._dist_3d(thumb_tip, idx_mcp) / pd_len
+            d_tip_pinky = self._dist_3d(thumb_tip, pinky_mcp) / pd_len
+            d_cmc_idx   = self._dist_3d(thumb_cmc, idx_mcp) / pd_len
 
-            v1 = (thumb_mcp.x - thumb_cmc.x, thumb_mcp.y - thumb_cmc.y, thumb_mcp.z - thumb_cmc.z)
-            v2 = (thumb_tip.x - thumb_ip.x,   thumb_tip.y - thumb_ip.y,   thumb_tip.z - thumb_ip.z)
-            v1_len = math.sqrt(v1[0]**2 + v1[1]**2 + v1[2]**2)
-            v2_len = math.sqrt(v2[0]**2 + v2[1]**2 + v2[2]**2)
+            is_straight = cos_ip < -0.65
+            is_abducted = (d_tip_idx > 0.55 and d_tip_pinky > 0.92) or (d_tip_idx > d_cmc_idx * 1.12)
 
-            dot_align = 0.0
-            if v1_len > 1e-6 and v2_len > 1e-6:
-                dot_align = (v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]) / (v1_len * v2_len)
-
-            thumb_extended = (
-                (ratio_pinky > 1.08 and dot_align > 0.25) or
-                (ratio_idx > 0.85 and d_tip_idx > d_cmc_idx * 1.15)
-            )
-
+            thumb_extended = is_straight and is_abducted
             states[0] = bool(thumb_extended)
 
         except Exception as e:

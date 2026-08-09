@@ -2,7 +2,7 @@
 telemetry_widget.py — Live Vision Telemetry Panel for WALLE Vision Dashboard.
 
 Displays real-time detection status for face (YuNet / MediaPipe), eyes, blink,
-facial expression, hands, individual fingers, pose and FPS.
+facial expression comparison (Heuristic vs Trained AI Model), hands, pose and FPS.
 
 Updated every frame via update_telemetry(result: VisionResult).
 """
@@ -100,14 +100,20 @@ class TelemetryWidget(QFrame):
         )
         root.addWidget(hdr)
 
-        # --- Face & Expression section ---
-        face_sec = _Section("Face & Expression", self)
+        # --- Face section ---
+        face_sec = _Section("Face Detection", self)
         self._v_face_detected = face_sec.add_row("Detector:")
         self._v_face_conf     = face_sec.add_row("Confidence:")
-        self._v_face_expr     = face_sec.add_row("Expression:")
         self._v_face_mouth    = face_sec.add_row("Mouth:")
         self._v_face_brow     = face_sec.add_row("Eyebrows:")
         root.addWidget(face_sec)
+
+        # --- Expression Comparison section (Heuristic vs Trained AI) ---
+        expr_sec = _Section("Expression Comparison", self)
+        self._v_expr_heuristic = expr_sec.add_row("Heuristic:")
+        self._v_expr_ai        = expr_sec.add_row("AI Model:")
+        self._v_expr_probs     = expr_sec.add_row("Top Probs:")
+        root.addWidget(expr_sec)
 
         # --- Eyes & Blink section ---
         eye_sec = _Section("Eyes & Blink", self)
@@ -152,6 +158,7 @@ class TelemetryWidget(QFrame):
     def update_telemetry(self, result: VisionResult) -> None:
         """Refresh all labels from the latest VisionResult."""
         self._update_face(result)
+        self._update_expression(result)
         self._update_eyes(result)
         self._update_hand(
             result.left_hand,
@@ -181,8 +188,6 @@ class TelemetryWidget(QFrame):
             self._set(self._v_face_detected, f"{f.detector_source} ({f.count})", _YES)
             conf_pct = int(f.confidence * 100)
             self._set(self._v_face_conf, f"{conf_pct}%", _YES)
-            expr_col = _YES if f.expression in ("SMILE", "SURPRISED") else _HEAD
-            self._set(self._v_face_expr, f.expression, expr_col)
             mouth_str = "OPEN" if f.mouth_open else "Closed"
             self._set(self._v_face_mouth, mouth_str, _MAYBE if f.mouth_open else _DIM)
             brow_str = "RAISED ↑" if f.eyebrows_raised else "Normal"
@@ -190,9 +195,34 @@ class TelemetryWidget(QFrame):
         else:
             self._set(self._v_face_detected, "NO", _NO)
             self._set(self._v_face_conf, "—", _DIM)
-            self._set(self._v_face_expr, "—", _DIM)
             self._set(self._v_face_mouth, "—", _DIM)
             self._set(self._v_face_brow, "—", _DIM)
+
+    def _update_expression(self, result: VisionResult) -> None:
+        f = result.face
+        if f.detected:
+            h_expr = f.heuristic_expression
+            h_col = _YES if h_expr in ("SMILE", "SURPRISED") else _HEAD
+            self._set(self._v_expr_heuristic, h_expr, h_col)
+
+            ai_expr = f.ai_expression
+            ai_pct  = int(f.ai_confidence * 100)
+            ai_str  = f"{ai_expr} {ai_pct}%" if f.ai_confidence > 0 else ai_expr
+            ai_col  = _YES if ai_expr in ("Happiness", "Surprise") else _HEAD
+            self._set(self._v_expr_ai, ai_str, ai_col)
+
+            # Format top 3 probabilities
+            probs = f.ai_expression_probabilities
+            if probs:
+                sorted_probs = sorted(probs.items(), key=lambda item: item[1], reverse=True)[:3]
+                probs_str = " ".join([f"{k[:4]}:{int(v*100)}%" for k, v in sorted_probs])
+                self._set(self._v_expr_probs, probs_str, _YES)
+            else:
+                self._set(self._v_expr_probs, "—", _DIM)
+        else:
+            self._set(self._v_expr_heuristic, "—", _DIM)
+            self._set(self._v_expr_ai,        "—", _DIM)
+            self._set(self._v_expr_probs,     "—", _DIM)
 
     def _update_eyes(self, result: VisionResult) -> None:
         e = result.eyes
