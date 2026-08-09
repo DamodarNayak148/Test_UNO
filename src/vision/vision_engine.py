@@ -17,8 +17,9 @@ Detector pipeline (each isolated -- one crash never halts the others):
      + HSEmotionONNX Trained Deep Learning AI Expression Model (EfficientNet-B0 ONNX)
        providing 8-class facial expression probabilities & EMA temporal smoothing
   3. Eye landmarks            -- derived from face mesh (iris 468/473, EAR contours)
-  4. MediaPipe HandLandmarker -- 21-landmark hand model, left + right
-  5. Finger detection         -- 3D orientation-invariant landmark geometry + temporal smoothing
+  4. MediaPipe GestureRecognizer -- 21-landmark 3D hand model + high-level AI gesture recognition
+                                    (Fist, Open Palm, Peace, Thumbs Up, Pointing, OK, Rock)
+  5. Finger & Thumb detection -- 3D orientation-invariant landmark geometry + temporal smoothing
                                  for rock-solid, jitter-free Thumb & Fingers 1-4
   6. MediaPipe PoseLandmarker -- 33-landmark body skeleton + pose classification
 
@@ -40,7 +41,7 @@ import os
 import time
 import threading
 import urllib.request
-from collections import deque
+from collections import deque, Counter
 from typing import Dict, List, Optional, Tuple, Any
 
 import cv2
@@ -100,17 +101,17 @@ _HSEMOTION_MODEL_URL = (
 )
 _HSEMOTION_MODEL_PATH = "models/enet_b0_8_best_vgaf.onnx"
 
+_GESTURE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
+    "gesture_recognizer/float16/1/gesture_recognizer.task"
+)
+_GESTURE_MODEL_PATH = "models/gesture_recognizer.task"
+
 _POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 )
 _POSE_MODEL_PATH = "models/pose_landmarker_lite.task"
-
-_HAND_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-    "hand_landmarker/float16/1/hand_landmarker.task"
-)
-_HAND_MODEL_PATH = "models/hand_landmarker.task"
 
 _FACE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -118,9 +119,18 @@ _FACE_MODEL_URL = (
 )
 _FACE_MODEL_PATH = "models/face_landmarker.task"
 
-# ---------------------------------------------------------------------------
-# Key pose landmark indices (MediaPipe Pose 33-landmark set)
-# ---------------------------------------------------------------------------
+# Category name mappings for MediaPipe GestureRecognizer
+_GESTURE_CATEGORY_MAP = {
+    "Closed_Fist": "FIST",
+    "Open_Palm": "OPEN PALM",
+    "Pointing_Up": "POINTING",
+    "Thumb_Down": "THUMBS DOWN",
+    "Thumb_Up": "THUMBS UP",
+    "Victory": "PEACE",
+    "ILoveYou": "I LOVE YOU",
+}
+
+# Key pose landmark indices
 _POSE_IDX = {
     "nose":       0,
     "l_ear":      7,  "r_ear":      8,
@@ -143,9 +153,7 @@ _POSE_CONNECTIONS = [
     (24,26),(26,28),                 # right leg
 ]
 
-# ---------------------------------------------------------------------------
-# Face mesh landmark indices (MediaPipe 478-landmark model)
-# ---------------------------------------------------------------------------
+# Face mesh landmark indices
 _FACE_LEFT_EYE   = [33, 7, 163, 144, 145, 153, 154, 155, 133,
                      173, 157, 158, 159, 160, 161, 246, 33]
 _FACE_RIGHT_EYE  = [362, 382, 381, 380, 374, 373, 390, 249, 263,
@@ -257,6 +265,10 @@ class VisionEngine:
         # Per-finger hysteresis smoothers (window=4, min_hits=2) for Left & Right hands
         self._lh_finger_smoothers = [DetectionHistory(window=4, min_hits=2) for _ in range(5)]
         self._rh_finger_smoothers = [DetectionHistory(window=4, min_hits=2) for _ in range(5)]
+
+        # Gesture temporal rolling history buffers (5-frame majority voting / hysteresis)
+        self._lh_gesture_history: deque = deque(maxlen=5)
+        self._rh_gesture_history: deque = deque(maxlen=5)
 
         # ---- Blink state machine tracking ----
         self._blink_count: int = 0
@@ -461,32 +473,33 @@ class VisionEngine:
                 print(f"[VisionEngine] Legacy pose init failed: {e}")
 
     def _init_hands(self, mp: Any) -> None:
-        """Initialise MediaPipe Hands (Tasks API preferred, legacy fallback)."""
+        """Initialise MediaPipe GestureRecognizer (Tasks API preferred, legacy fallback)."""
         if hasattr(mp, "tasks"):
             try:
                 from mediapipe.tasks.python import vision as mp_vision
                 from mediapipe.tasks.python.core import base_options as bo
 
-                if not os.path.exists(_HAND_MODEL_PATH):
-                    os.makedirs(os.path.dirname(_HAND_MODEL_PATH), exist_ok=True)
-                    print(f"[VisionEngine] Downloading hand model -> {_HAND_MODEL_PATH} ...")
-                    urllib.request.urlretrieve(_HAND_MODEL_URL, _HAND_MODEL_PATH)
+                if not os.path.exists(_GESTURE_MODEL_PATH):
+                    os.makedirs(os.path.dirname(_GESTURE_MODEL_PATH), exist_ok=True)
+                    print(f"[VisionEngine] Downloading gesture model -> {_GESTURE_MODEL_PATH} ...")
+                    urllib.request.urlretrieve(_GESTURE_MODEL_URL, _GESTURE_MODEL_PATH)
 
-                options = mp_vision.HandLandmarkerOptions(
-                    base_options=bo.BaseOptions(model_asset_path=_HAND_MODEL_PATH),
+                options = mp_vision.GestureRecognizerOptions(
+                    base_options=bo.BaseOptions(model_asset_path=_GESTURE_MODEL_PATH),
                     running_mode=mp_vision.RunningMode.IMAGE,
                     num_hands=2,
                     min_hand_detection_confidence=0.5,
                     min_hand_presence_confidence=0.5,
                     min_tracking_confidence=0.5,
                 )
-                self._hands_solution = mp_vision.HandLandmarker.create_from_options(options)
+                self._hands_solution = mp_vision.GestureRecognizer.create_from_options(options)
                 self._hands_is_tasks_api = True
-                print("[VisionEngine] Hand Landmarker (Tasks API) initialized.")
+                print("[VisionEngine] MediaPipe GestureRecognizer (Tasks API) initialized.")
                 return
             except Exception as e:
-                print(f"[VisionEngine] Tasks API hands failed: {e} -- trying legacy.")
+                print(f"[VisionEngine] Tasks API GestureRecognizer failed: {e} -- trying HandLandmarker.")
 
+        # Fallback to HandLandmarker or legacy mp.solutions.hands
         if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
             try:
                 self._hands_solution = mp.solutions.hands.Hands(
@@ -500,8 +513,6 @@ class VisionEngine:
                 print("[VisionEngine] Hand Landmarker (legacy solutions) initialized.")
             except Exception as e:
                 print(f"[VisionEngine] Hands init failed: {e}")
-        else:
-            print("[VisionEngine] No MediaPipe Hands API available.")
 
     # ------------------------------------------------------------------
     # Main per-frame entry point
@@ -559,10 +570,12 @@ class VisionEngine:
         if not lh.detected:
             for s in self._lh_finger_smoothers:
                 s.reset()
+            self._lh_gesture_history.clear()
 
         if not rh.detected:
             for s in self._rh_finger_smoothers:
                 s.reset()
+            self._rh_gesture_history.clear()
 
         # ---------- FPS overlay ----------
         self._draw_fps(annotated, fps)
@@ -1109,13 +1122,13 @@ class VisionEngine:
             return FaceResult()
 
     # ------------------------------------------------------------------
-    # Detector 2: MediaPipe Hands + 3D Orientation-Invariant Fingers
+    # Detector 2: MediaPipe GestureRecognizer + 3D Orientation-Invariant Fingers
     # ------------------------------------------------------------------
 
     def _detect_hands(
         self, annotated: np.ndarray, original: np.ndarray
     ) -> Tuple[HandResult, HandResult]:
-        """Run MediaPipe HandLandmarker; return (left_hand, right_hand)."""
+        """Run MediaPipe GestureRecognizer; return (left_hand, right_hand)."""
         lh = HandResult(handedness="Left")
         rh = HandResult(handedness="Right")
 
@@ -1130,7 +1143,7 @@ class VisionEngine:
                 mp_img = self._mp.Image(
                     image_format=self._mp.ImageFormat.SRGB, data=rgb
                 )
-                result = self._hands_solution.detect(mp_img)
+                result = self._hands_solution.recognize(mp_img)
                 if not result or not result.hand_landmarks:
                     return lh, rh
 
@@ -1142,8 +1155,16 @@ class VisionEngine:
                         label      = cat.display_name
                         confidence = float(cat.score)
 
+                    raw_gesture = "UNKNOWN"
+                    raw_g_conf = 0.0
+                    if result.gestures and idx < len(result.gestures) and result.gestures[idx]:
+                        g_cat = result.gestures[idx][0]
+                        if g_cat.category_name and g_cat.category_name != "Unrecognized":
+                            raw_gesture = _GESTURE_CATEGORY_MAP.get(g_cat.category_name, g_cat.category_name.upper())
+                            raw_g_conf = float(g_cat.score)
+
                     hand = self._build_hand_result(
-                        annotated, hand_lms, w, h, label, confidence
+                        annotated, hand_lms, w, h, label, confidence, raw_gesture, raw_g_conf
                     )
                     if label == "Left":
                         lh = hand
@@ -1165,7 +1186,7 @@ class VisionEngine:
                         confidence = float(cls.score)
 
                     hand = self._build_hand_result(
-                        annotated, hand_lms_proto.landmark, w, h, label, confidence
+                        annotated, hand_lms_proto.landmark, w, h, label, confidence, "UNKNOWN", 0.0
                     )
                     if label == "Left":
                         lh = hand
@@ -1185,8 +1206,10 @@ class VisionEngine:
         h: int,
         label: str,
         confidence: float,
+        raw_gesture: str,
+        raw_g_conf: float,
     ) -> HandResult:
-        """Compute pixel positions, 3D finger states with temporal smoothing, and draw for one hand."""
+        """Compute pixel positions, 3D finger states, gesture classification, and draw for one hand."""
         pixels: List[Tuple[int, int]] = [
             (int(lm.x * w), int(lm.y * h)) for lm in landmarks
         ]
@@ -1212,8 +1235,31 @@ class VisionEngine:
         fingers_up   = sum(finger_states)
         fingers_dict = {name: state for name, state in zip(_FINGER_NAMES, finger_states)}
 
+        # Landmark geometry gesture fallback
+        geometry_gesture = self._compute_geometry_gesture(finger_states, landmarks)
+
+        # Final gesture resolution: prefer AI model prediction if confidence > 0.40, else fallback to geometry gesture
+        if raw_gesture != "UNKNOWN" and raw_g_conf >= 0.40:
+            final_raw_gesture = raw_gesture
+            final_g_conf = raw_g_conf
+        elif geometry_gesture != "UNKNOWN":
+            final_raw_gesture = geometry_gesture
+            final_g_conf = 0.85
+        else:
+            final_raw_gesture = "UNKNOWN"
+            final_g_conf = 0.0
+
+        # Temporal Gesture Hysteresis (5-frame majority voting)
+        g_history = self._lh_gesture_history if label == "Left" else self._rh_gesture_history
+        g_history.append(final_raw_gesture)
+
+        # Majority vote
+        counts = Counter(g_history)
+        top_gesture, top_count = counts.most_common(1)[0]
+        smoothed_gesture = top_gesture if top_count >= 2 else final_raw_gesture
+
         colour = _COL_HAND_L if label == "Left" else _COL_HAND_R
-        self._draw_hand(annotated, pixels, finger_states, colour, label)
+        self._draw_hand(annotated, pixels, finger_states, colour, label, smoothed_gesture)
 
         return HandResult(
             detected=True,
@@ -1224,9 +1270,58 @@ class VisionEngine:
             fingers_up=fingers_up,
             handedness=label,
             confidence=confidence,
+            gesture=smoothed_gesture,
+            gesture_confidence=final_g_conf,
+            geometry_gesture=geometry_gesture,
             wrist=wrist,
             center=center,
         )
+
+    def _compute_geometry_gesture(
+        self, finger_states: List[bool], landmarks: Any
+    ) -> str:
+        """Compute heuristic landmark geometry gesture fallback."""
+        try:
+            thumb, index, middle, ring, pinky = finger_states
+
+            # Check OK gesture: Thumb tip near Index tip while middle/ring/pinky extended
+            if len(landmarks) >= 21 and middle and ring and pinky:
+                d_thumb_idx = self._dist_3d(landmarks[4], landmarks[8])
+                d_palm = self._dist_3d(landmarks[0], landmarks[9])
+                if d_palm > 1e-6 and (d_thumb_idx / d_palm) < 0.35:
+                    return "OK"
+
+            # Check Rock / Horns: Index and Pinky UP, Middle and Ring DOWN
+            if index and pinky and not middle and not ring:
+                return "ROCK"
+
+            # Check Peace: Index and Middle UP, Ring and Pinky DOWN
+            if index and middle and not ring and not pinky:
+                return "PEACE"
+
+            # Check Gun: Thumb and Index UP, Middle, Ring, Pinky DOWN
+            if thumb and index and not middle and not ring and not pinky:
+                return "GUN"
+
+            # Check Pointing: Index UP, all others DOWN
+            if index and not thumb and not middle and not ring and not pinky:
+                return "POINTING"
+
+            # Check Thumbs Up: Thumb UP, all 4 fingers DOWN
+            if thumb and not index and not middle and not ring and not pinky:
+                return "THUMBS UP"
+
+            # Check Open Palm: All 5 UP
+            if thumb and index and middle and ring and pinky:
+                return "OPEN PALM"
+
+            # Check Fist: All 5 DOWN
+            if not thumb and not index and not middle and not ring and not pinky:
+                return "FIST"
+
+            return "UNKNOWN"
+        except Exception:
+            return "UNKNOWN"
 
     def _compute_finger_states(
         self, landmarks: Any, handedness: str
@@ -1306,8 +1401,9 @@ class VisionEngine:
         finger_states: List[bool],
         colour:        Tuple[int, int, int],
         label:         str,
+        gesture:       str = "UNKNOWN",
     ) -> None:
-        """Draw hand skeleton, joints, and per-finger-tip state indicators."""
+        """Draw hand skeleton, joints, per-finger-tip state indicators, and gesture badge."""
         for a, b in _HAND_CONNECTIONS:
             if a < len(pixels) and b < len(pixels):
                 cv2.line(annotated, pixels[a], pixels[b], colour, 2)
@@ -1323,9 +1419,10 @@ class VisionEngine:
 
         if pixels:
             wx, wy = pixels[0]
+            g_str = f" | {gesture}" if gesture != "UNKNOWN" else ""
             cv2.putText(
                 annotated,
-                f"{label[0]}H {sum(finger_states)}/5",
+                f"{label[0]}H {sum(finger_states)}/5{g_str}",
                 (wx - 20, max(14, wy - 12)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1,
             )

@@ -2,7 +2,8 @@
 telemetry_widget.py — Live Vision Telemetry Panel for WALLE Vision Dashboard.
 
 Displays real-time detection status for face (YuNet / MediaPipe), eyes, blink,
-facial expression comparison (Heuristic vs Trained AI Model), hands, pose and FPS.
+facial expression comparison (Heuristic vs Trained AI Model), hands, AI hand gestures,
+individual fingers, pose and FPS.
 
 Updated every frame via update_telemetry(result: VisionResult).
 """
@@ -115,6 +116,12 @@ class TelemetryWidget(QFrame):
         self._v_expr_probs     = expr_sec.add_row("Top Probs:")
         root.addWidget(expr_sec)
 
+        # --- Hand Gestures section ---
+        gest_sec = _Section("Hand Gestures", self)
+        self._v_gest_left  = gest_sec.add_row("Left Hand:")
+        self._v_gest_right = gest_sec.add_row("Right Hand:")
+        root.addWidget(gest_sec)
+
         # --- Eyes & Blink section ---
         eye_sec = _Section("Eyes & Blink", self)
         self._v_eye_left     = eye_sec.add_row("Left Eye:")
@@ -159,6 +166,7 @@ class TelemetryWidget(QFrame):
         """Refresh all labels from the latest VisionResult."""
         self._update_face(result)
         self._update_expression(result)
+        self._update_gestures(result)
         self._update_eyes(result)
         self._update_hand(
             result.left_hand,
@@ -223,6 +231,28 @@ class TelemetryWidget(QFrame):
             self._set(self._v_expr_heuristic, "—", _DIM)
             self._set(self._v_expr_ai,        "—", _DIM)
             self._set(self._v_expr_probs,     "—", _DIM)
+
+    def _update_gestures(self, result: VisionResult) -> None:
+        lh = result.left_hand
+        rh = result.right_hand
+
+        if lh.detected and lh.gesture != "UNKNOWN":
+            conf_pct = int(lh.gesture_confidence * 100)
+            c_str = f" {conf_pct}%" if conf_pct > 0 else ""
+            self._set(self._v_gest_left, f"{lh.gesture}{c_str}", _YES)
+        elif lh.detected:
+            self._set(self._v_gest_left, "Unknown", _MAYBE)
+        else:
+            self._set(self._v_gest_left, "—", _DIM)
+
+        if rh.detected and rh.gesture != "UNKNOWN":
+            conf_pct = int(rh.gesture_confidence * 100)
+            c_str = f" {conf_pct}%" if conf_pct > 0 else ""
+            self._set(self._v_gest_right, f"{rh.gesture}{c_str}", _YES)
+        elif rh.detected:
+            self._set(self._v_gest_right, "Unknown", _MAYBE)
+        else:
+            self._set(self._v_gest_right, "—", _DIM)
 
     def _update_eyes(self, result: VisionResult) -> None:
         e = result.eyes

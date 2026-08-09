@@ -2,7 +2,7 @@
 vision_result.py — Unified detection result dataclasses for WALLE Vision.
 
 All detectors write into this structure. The UI and any future consumer
-(e.g. a re-attached Game Master) reads from here.
+(e.g. a re-attached Game Master or AI reasoning layer) reads from here.
 
 Backward compatible: all new fields carry default values so existing
 code that constructs these dataclasses without keyword args still works.
@@ -105,8 +105,8 @@ class EyeResult:
 @dataclass
 class HandResult:
     """
-    MediaPipe Hands result for one hand (left or right).
-    Uses Tasks API HandLandmarker (21 landmarks per hand).
+    MediaPipe Hands and Gesture recognition result for one hand (left or right).
+    Uses Tasks API GestureRecognizer (21 landmarks + 8 gesture categories per hand).
     """
     detected: bool = False
 
@@ -129,6 +129,14 @@ class HandResult:
 
     # Detection confidence from MediaPipe handedness score (0.0–1.0)
     confidence: float = 0.0
+
+    # --- Gesture additions ---
+    # High-level gesture classification: "THUMBS UP" | "OPEN PALM" | "FIST" | "PEACE" | "POINTING" | "OK" | "ROCK" | "UNKNOWN"
+    gesture: str = "UNKNOWN"
+    gesture_confidence: float = 0.0
+
+    # Low-level landmark geometry gesture fallback
+    geometry_gesture: str = "UNKNOWN"
 
     # Key positions in pixel space
     wrist:  Optional[Tuple[int, int]] = None   # landmark 0
@@ -171,7 +179,7 @@ class VisionResult:
     Unified snapshot of a single processed camera frame.
 
     Produced by VisionEngine.process_frame() and consumed by the UI and
-    any future reasoning layer (e.g., Game Master).
+    any future reasoning layer (e.g., Game Master or AI Brain).
     """
 
     face:       FaceResult = field(default_factory=FaceResult)

@@ -10,8 +10,9 @@ Tests cover:
   6. Expression classification (NEUTRAL, SMILE, SURPRISED, ANGRY, SAD)
   7. YuNet face detector initialization & extraction (bbox, confidence, 5 keypoints)
   8. Trained AI Expression Model (HSEmotionONNX) crop inference & probabilities
-  9. VisionResult dataclasses & structure
-  10. VisionEngine frame processing & temporal smoothers
+  9. MediaPipe GestureRecognizer & Hand Gesture classification (Peace, Fist, Open Palm, Thumbs Up, Pointing, OK, Rock)
+  10. VisionResult dataclasses & structure
+  11. VisionEngine frame processing & temporal smoothers
 
 Run:
     python -m pytest tests/test_vision_engine.py -v
@@ -373,7 +374,63 @@ class TestTrainedAIExpressionModel:
 
 
 # ===========================================================================
-# 8. VisionResult Structure Tests
+# 8. MediaPipe GestureRecognizer & Hand Gesture Tests
+# ===========================================================================
+
+class TestHandGestureRecognition:
+
+    @pytest.fixture(scope="class")
+    def engine(self):
+        from src.vision.vision_engine import VisionEngine
+        return VisionEngine()
+
+    def test_gesture_solution_initialization(self, engine):
+        assert engine._hands_solution is not None, "MediaPipe GestureRecognizer solution should be initialized"
+
+    def test_geometry_gesture_computation(self, engine):
+        # Test Peace gesture finger states
+        peace_states = [False, True, True, False, False]
+        lms = [_make_lm(0.5, 0.5) for _ in range(21)]
+        g_peace = engine._compute_geometry_gesture(peace_states, lms)
+        assert g_peace == "PEACE"
+
+        # Test Open Palm gesture
+        palm_states = [True, True, True, True, True]
+        g_palm = engine._compute_geometry_gesture(palm_states, lms)
+        assert g_palm == "OPEN PALM"
+
+        # Test Fist gesture
+        fist_states = [False, False, False, False, False]
+        g_fist = engine._compute_geometry_gesture(fist_states, lms)
+        assert g_fist == "FIST"
+
+        # Test Thumbs Up gesture
+        tup_states = [True, False, False, False, False]
+        g_tup = engine._compute_geometry_gesture(tup_states, lms)
+        assert g_tup == "THUMBS UP"
+
+        # Test Pointing gesture
+        point_states = [False, True, False, False, False]
+        g_point = engine._compute_geometry_gesture(point_states, lms)
+        assert g_point == "POINTING"
+
+        # Test Rock gesture
+        rock_states = [False, True, False, False, True]
+        g_rock = engine._compute_geometry_gesture(rock_states, lms)
+        assert g_rock == "ROCK"
+
+    def test_hand_result_gesture_fields(self):
+        from src.vision.vision_result import HandResult
+        hr = HandResult()
+        assert hasattr(hr, "gesture")
+        assert hasattr(hr, "gesture_confidence")
+        assert hasattr(hr, "geometry_gesture")
+        assert hr.gesture == "UNKNOWN"
+        assert hr.gesture_confidence == 0.0
+
+
+# ===========================================================================
+# 9. VisionResult Structure Tests
 # ===========================================================================
 
 class TestVisionResultStructure:
@@ -388,16 +445,13 @@ class TestVisionResultStructure:
         assert isinstance(vr.right_hand, HandResult)
         assert isinstance(vr.pose, PoseResult)
 
-        # Expression comparison fields
-        assert hasattr(vr.face, "heuristic_expression")
-        assert hasattr(vr.face, "ai_expression")
-        assert hasattr(vr.face, "ai_confidence")
-        assert hasattr(vr.face, "ai_expression_probabilities")
-        assert hasattr(vr.face, "expression")
+        # Gesture fields on hands
+        assert hasattr(vr.left_hand, "gesture")
+        assert hasattr(vr.right_hand, "gesture")
 
 
 # ===========================================================================
-# 9. VisionEngine Execution Tests
+# 10. VisionEngine Execution Tests
 # ===========================================================================
 
 class TestVisionEngineExecution:
