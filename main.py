@@ -1,14 +1,23 @@
+"""
+main.py — WALLE Vision entry point.
+
+Active flow:
+    Webcam → HAL (SimCamera) → VisionEngine → VisionResult → WALLE Vision Dashboard
+
+Game Master, LLM, PromptManager are NOT imported here.
+They remain in src/engine/ for future re-integration once the vision
+perception layer is stable.
+"""
+
 import sys
 import yaml
 import os
 from PySide6.QtWidgets import QApplication
 
 from src.hal.hardware_factory import HardwareFactory
-from src.engine.prompt_manager import PromptManager
-from src.ai.llm_service import LLMService
-from src.ai.vision_processor import VisionProcessor
-from src.engine.game_master import GameMaster
+from src.vision.vision_engine import VisionEngine
 from src.ui.main_window import MainWindow
+
 
 def load_config(config_path: str = "config/default_config.yaml") -> dict:
     if os.path.exists(config_path):
@@ -16,39 +25,25 @@ def load_config(config_path: str = "config/default_config.yaml") -> dict:
             return yaml.safe_load(f) or {}
     return {}
 
+
 def main():
-    print("==================================================")
-    print("      PHYSICAL AI GAME MASTER - WINDOWS PC        ")
-    print("==================================================")
+    print("=" * 54)
+    print("         WALLE VISION — Real-Time Human Perception      ")
+    print("=" * 54)
 
     # 1. Load Configuration
     config = load_config()
 
-    # 2. Instantiate Hardware Suite via HAL Factory
+    # 2. Instantiate Hardware Suite via HAL Factory (unchanged)
     hw = HardwareFactory.create_hardware_suite(config)
     hw.camera.start_stream()
 
-    # 3. Instantiate AI Services & Prompt Manager
-    ai_conf = config.get("ai", {})
-    prompt_mgr = PromptManager("config/game_prompts.json")
-    llm_service = LLMService(
-        provider=ai_conf.get("llm_provider", "mock"),
-        api_key=ai_conf.get("api_key", ""),
-        model_name=ai_conf.get("model_name", "gemini-2.5-flash")
-    )
-    vision_processor = VisionProcessor()
+    # 3. Instantiate Vision Engine
+    vision_engine = VisionEngine()
 
-    # 4. Instantiate Core Game Master Engine
-    gm = GameMaster(
-        hw=hw,
-        prompt_mgr=prompt_mgr,
-        llm_service=llm_service,
-        vision_proc=vision_processor
-    )
-
-    # 5. Launch PySide6 GUI Dashboard
+    # 4. Launch PySide6 Vision Dashboard
     app = QApplication(sys.argv)
-    window = MainWindow(hw=hw, gm=gm)
+    window = MainWindow(hw=hw, vision_engine=vision_engine)
     window.show()
 
     # Run Event Loop
@@ -57,6 +52,7 @@ def main():
     # Cleanup Hardware Resources on Close
     hw.camera.stop_stream()
     sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
