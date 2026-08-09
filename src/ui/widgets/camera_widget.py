@@ -4,7 +4,7 @@ camera_widget.py — WALLE Vision live camera feed widget.
 Drives the VisionEngine on every QTimer tick:
   1. Grabs a frame from the HAL camera
   2. Passes it through VisionEngine.process_frame()
-  3. Displays the annotated BGR frame
+  3. Displays the annotated BGR frame via optimized Qt pixmap rendering
   4. Fires on_result(VisionResult) callback so the telemetry panel can update
 """
 
@@ -24,17 +24,6 @@ from src.vision.vision_result import VisionResult
 class CameraWidget(QFrame):
     """
     Live camera viewport that runs VisionEngine on every frame.
-
-    Parameters
-    ----------
-    camera : BaseCamera
-        HAL camera driver (SimCamera or future UNO-Q driver).
-    vision_engine : VisionEngine
-        Shared VisionEngine instance.  Owned by the caller; not started/stopped here.
-    on_result : optional callable(VisionResult)
-        Called after each frame is processed so the telemetry panel can refresh.
-    fps : int
-        Target update rate (default 30).
     """
 
     def __init__(
@@ -65,9 +54,10 @@ class CameraWidget(QFrame):
         self.image_label.setStyleSheet(
             "color: #00d4ff; font-weight: bold; font-size: 14px; background: transparent; border: none;"
         )
+        self.image_label.setScaledContents(True)
         layout.addWidget(self.image_label)
 
-        # Drive the loop via Qt timer — keeps everything on the GUI thread
+        # Drive loop via QTimer tick
         interval_ms = max(16, 1000 // fps)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update_frame)
@@ -78,20 +68,20 @@ class CameraWidget(QFrame):
     # ------------------------------------------------------------------
 
     def _update_frame(self) -> None:
-        """Called every timer tick.  Grab → process → display → notify."""
+        """Called every timer tick. Grab -> process -> display -> notify."""
         if not self.camera or not self.camera.is_opened():
             return
 
         frame = self.camera.get_frame()
 
-        # Run VisionEngine (handles None/invalid frames internally)
+        # Run VisionEngine
         try:
             annotated, result = self._engine.process_frame(frame)
         except Exception as e:
             print(f"[CameraWidget] VisionEngine exception: {e}")
             return
 
-        # Convert BGR (OpenCV) → RGB (Qt) for display
+        # Convert BGR (OpenCV) -> RGB (Qt) for display
         try:
             rgb_frame = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_frame.shape
@@ -99,12 +89,7 @@ class CameraWidget(QFrame):
                 rgb_frame.data, w, h, ch * w, QImage.Format.Format_RGB888
             )
             pixmap = QPixmap.fromImage(q_img)
-            scaled = pixmap.scaled(
-                self.image_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.image_label.setPixmap(scaled)
+            self.image_label.setPixmap(pixmap)
         except Exception as e:
             print(f"[CameraWidget] Frame display error: {e}")
             return

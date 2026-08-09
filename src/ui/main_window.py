@@ -1,9 +1,9 @@
 """
-main_window.py — WALLE Vision Dashboard (replaces game-master dashboard).
+main_window.py — WALLE Vision & Voice Dashboard.
 
 Layout:
   ┌─────────────────────────────────────────────┐
-  │            WALLE VISION   header            │
+  │         WALLE VISION & VOICE  header        │
   ├───────────────────────────┬─────────────────┤
   │                           │                 │
   │   CameraWidget            │ TelemetryWidget │
@@ -11,8 +11,10 @@ Layout:
   │                           │                 │
   └───────────────────────────┴─────────────────┘
 
-The Game Master, LLM, PromptManager are intentionally NOT imported here.
-They remain on disk for future re-integration.
+Features:
+  - Real-time AI Vision (YuNet + MediaPipe + HSEmotionONNX + GestureRecognizer + Pose)
+  - Push-to-Talk Local Speech-to-Text Voice Engine (Hold SPACE to talk)
+  - Non-blocking Qt UI architecture
 """
 
 from PySide6.QtWidgets import (
@@ -20,23 +22,27 @@ from PySide6.QtWidgets import (
     QLabel, QSplitter, QFrame,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeyEvent
 
 from src.hal.hardware_factory import HardwareSuite
 from src.vision.vision_engine import VisionEngine
+from src.voice.voice_engine import VoiceEngine
 from src.ui.widgets.camera_widget import CameraWidget
 from src.ui.widgets.telemetry_widget import TelemetryWidget
 
 
 class MainWindow(QMainWindow):
-    """WALLE Vision Dashboard — real-time human perception display."""
+    """WALLE Vision & Voice Dashboard — real-time human perception display."""
 
     def __init__(self, hw: HardwareSuite, vision_engine: VisionEngine):
         super().__init__()
         self.hw = hw
         self._engine = vision_engine
 
-        self.setWindowTitle("WALLE Vision — Real-Time Human Perception")
+        # Voice Subsystem
+        self.voice_engine = VoiceEngine()
+
+        self.setWindowTitle("WALLE Vision & Voice — Local Perception Dashboard")
         self.resize(1280, 760)
         self.setMinimumSize(900, 600)
         self.setStyleSheet("""
@@ -66,8 +72,12 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # Telemetry panel (created first so we can pass its callback)
+        # Telemetry panel
         self.telemetry = TelemetryWidget()
+
+        # Connect voice result signals to telemetry panel
+        self.voice_engine.result_updated.connect(self.telemetry.update_voice_telemetry)
+        self.telemetry.update_voice_telemetry(self.voice_engine.get_result())
 
         # Camera widget — wired to VisionEngine and telemetry updater
         self.camera_widget = CameraWidget(
@@ -88,7 +98,29 @@ class MainWindow(QMainWindow):
         root.addWidget(status)
 
     # ------------------------------------------------------------------
-    # Header
+    # Push-to-Talk Keyboard Event Handling (Hold SPACE to talk)
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """Key press event: Hold SPACE to start recording."""
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            if not self.voice_engine.is_listening():
+                self.voice_engine.start_recording()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        """Key release event: Release SPACE to transcribe audio."""
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            if self.voice_engine.is_listening():
+                self.voice_engine.stop_recording_and_transcribe()
+        else:
+            super().keyReleaseEvent(event)
+
+    # ------------------------------------------------------------------
+    # Header & Status Bar
     # ------------------------------------------------------------------
 
     def _build_header(self) -> QWidget:
@@ -103,17 +135,14 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(16, 0, 16, 0)
 
-        # Left: logo text
-        logo = QLabel("⬡  WALLE VISION")
+        logo = QLabel("⬡  WALLE VISION & VOICE")
         logo.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         logo.setStyleSheet("color: #00d4ff; border: none; background: transparent; letter-spacing: 2px;")
 
-        # Centre: subtitle
-        sub = QLabel("Real-Time Human Perception  ·  AI Vision Layer")
+        sub = QLabel("Real-Time Perception  ·  Vision + Local Vosk STT Voice Layer")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color: #4a6fa5; font-size: 11px; border: none; background: transparent;")
 
-        # Right: mode badge
         badge = QLabel("LIVE  ●")
         badge.setStyleSheet(
             "color: #00ff88; font-size: 12px; font-weight: bold; "
@@ -126,10 +155,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(badge)
         return frame
 
-    # ------------------------------------------------------------------
-    # Status bar
-    # ------------------------------------------------------------------
-
     def _build_status_bar(self) -> QWidget:
         frame = QFrame()
         frame.setFixedHeight(24)
@@ -140,19 +165,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(4, 0, 4, 0)
 
         info = QLabel(
-            "Detectors: Haar Face  ·  Haar Eyes  ·  MediaPipe Hands  ·  MediaPipe Pose    "
-            "|    HAL: SimCamera    |    Press ESC to quit"
+            "Perception: YuNet Face  ·  HSEmotion AI  ·  Gesture AI  ·  Vosk Local STT [Hold SPACE to Talk]    "
+            "|    HAL: Independent    |    Press ESC to quit"
         )
         info.setStyleSheet("color: #3a4560; font-size: 10px;")
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(info)
         return frame
-
-    # ------------------------------------------------------------------
-    # Keyboard shortcuts
-    # ------------------------------------------------------------------
-
-    def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Escape:
-            self.close()
-        super().keyPressEvent(event)

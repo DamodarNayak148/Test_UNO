@@ -191,6 +191,8 @@ class VisionResult:
     avg_brightness: float = 0.0
     camera_dark:    bool  = False   # True when frame was too dark to process
     fps:            float = 0.0
+    process_time_ms: float = 0.0
+    stage_timing:   Dict[str, float] = field(default_factory=dict)
     timestamp:      float = 0.0
 
     @staticmethod
