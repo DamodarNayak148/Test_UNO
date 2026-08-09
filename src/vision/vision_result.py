@@ -19,8 +19,11 @@ from typing import Dict, List, Optional, Tuple, Any
 @dataclass
 class FaceResult:
     """
-    MediaPipe FaceLandmarker detection result (primary).
-    Falls back to Haar bounding box if FaceLandmarker unavailable.
+    Face detection and perception result.
+    Primary face detector: YuNet (cv2.FaceDetectorYN) for high-accuracy bounding boxes,
+    confidence scores, and 5 keypoints.
+    Primary face mesh landmarker: MediaPipe FaceLandmarker (478 landmarks) for eyelids,
+    iris, EAR, MAR, smile, eyebrow elevation, and expression.
     """
     detected: bool = False
     count: int = 0
@@ -31,6 +34,13 @@ class FaceResult:
     # Pixel centre of the primary (largest/first) face
     center: Tuple[int, int] = (0, 0)
 
+    # Detector confidence (YuNet detection confidence score 0.0-1.0)
+    confidence: float = 0.0
+
+    # YuNet 5 2D keypoints [(x, y), ...] for primary face:
+    # [right_eye, left_eye, nose_tip, right_mouth, left_mouth]
+    keypoints: List[Tuple[int, int]] = field(default_factory=list)
+
     # --- MediaPipe FaceLandmarker additions ---
     # Raw NormalizedLandmark objects (up to 478 with attention mesh model)
     landmarks: List[Any] = field(default_factory=list)
@@ -40,10 +50,7 @@ class FaceResult:
     # Key feature positions in pixel space (None if not available)
     left_eye_center:  Optional[Tuple[int, int]] = None   # iris landmark 468
     right_eye_center: Optional[Tuple[int, int]] = None   # iris landmark 473
-    nose_tip:         Optional[Tuple[int, int]] = None   # landmark 4
-
-    # Detection confidence (1.0 when detected via FaceLandmarker)
-    confidence: float = 0.0
+    nose_tip:         Optional[Tuple[int, int]] = None   # landmark 4 or YuNet keypoint
 
     # --- Facial Configuration & Expression ---
     mouth_open: bool = False
@@ -51,6 +58,7 @@ class FaceResult:
     smile: bool = False
     eyebrows_raised: bool = False
     expression: str = "NEUTRAL"       # "NEUTRAL" | "SMILE" | "SURPRISED" | "ANGRY" | "SAD"
+    detector_source: str = "YuNet"    # "YuNet" | "MediaPipe" | "Haar"
 
 
 @dataclass

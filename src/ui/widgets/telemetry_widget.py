@@ -1,8 +1,8 @@
 """
 telemetry_widget.py — Live Vision Telemetry Panel for WALLE Vision Dashboard.
 
-Displays real-time detection status for face, eyes, blink, facial expression,
-hands, individual fingers (Thumb, Index, Middle, Ring, Pinky), pose and FPS.
+Displays real-time detection status for face (YuNet / MediaPipe), eyes, blink,
+facial expression, hands, individual fingers, pose and FPS.
 
 Updated every frame via update_telemetry(result: VisionResult).
 """
@@ -102,7 +102,8 @@ class TelemetryWidget(QFrame):
 
         # --- Face & Expression section ---
         face_sec = _Section("Face & Expression", self)
-        self._v_face_detected = face_sec.add_row("Detected:")
+        self._v_face_detected = face_sec.add_row("Detector:")
+        self._v_face_conf     = face_sec.add_row("Confidence:")
         self._v_face_expr     = face_sec.add_row("Expression:")
         self._v_face_mouth    = face_sec.add_row("Mouth:")
         self._v_face_brow     = face_sec.add_row("Eyebrows:")
@@ -177,7 +178,9 @@ class TelemetryWidget(QFrame):
     def _update_face(self, result: VisionResult) -> None:
         f = result.face
         if f.detected:
-            self._set(self._v_face_detected, f"YES ({f.count})", _YES)
+            self._set(self._v_face_detected, f"{f.detector_source} ({f.count})", _YES)
+            conf_pct = int(f.confidence * 100)
+            self._set(self._v_face_conf, f"{conf_pct}%", _YES)
             expr_col = _YES if f.expression in ("SMILE", "SURPRISED") else _HEAD
             self._set(self._v_face_expr, f.expression, expr_col)
             mouth_str = "OPEN" if f.mouth_open else "Closed"
@@ -186,6 +189,7 @@ class TelemetryWidget(QFrame):
             self._set(self._v_face_brow, brow_str, _YES if f.eyebrows_raised else _DIM)
         else:
             self._set(self._v_face_detected, "NO", _NO)
+            self._set(self._v_face_conf, "—", _DIM)
             self._set(self._v_face_expr, "—", _DIM)
             self._set(self._v_face_mouth, "—", _DIM)
             self._set(self._v_face_brow, "—", _DIM)
@@ -219,7 +223,6 @@ class TelemetryWidget(QFrame):
             colour = _YES if n == total else (_MAYBE if n > 0 else _NO)
             self._set(v_fingers, f"{n}/{total}", colour)
 
-            # Mini icons: T I M R P (bracketed if extended)
             names = ["T", "I", "M", "R", "P"]
             icons = "".join(
                 f"[{n}]" if up else f" {n} "

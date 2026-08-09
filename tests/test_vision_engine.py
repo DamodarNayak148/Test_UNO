@@ -8,8 +8,9 @@ Tests cover:
   4. Mouth aspect ratio (open vs closed)
   5. Smile detection & eyebrow elevation
   6. Expression classification (NEUTRAL, SMILE, SURPRISED, ANGRY, SAD)
-  7. VisionResult dataclasses & structure
-  8. VisionEngine frame processing & temporal smoothers
+  7. YuNet face detector initialization & extraction (bbox, confidence, 5 keypoints)
+  8. VisionResult dataclasses & structure
+  9. VisionEngine frame processing & temporal smoothers
 
 Run:
     python -m pytest tests/test_vision_engine.py -v
@@ -191,9 +192,9 @@ class TestBlinkStateMachine:
         blink_detected = False
 
         # Frame 2: Closed (eye blink starts)
-        closed_frames += 1  # 1 frame closed
+        closed_frames += 1
         # Frame 3: Closed
-        closed_frames += 1  # 2 frames closed
+        closed_frames += 1
 
         # Frame 4: Eyes re-open (transition complete!)
         if 1 <= closed_frames <= 10:
@@ -206,10 +207,9 @@ class TestBlinkStateMachine:
     def test_prolonged_closed_eyes_does_not_count_multiple_blinks(self):
         """Eyes closed for 20 frames (sleeping/squinting) should NOT count as a blink."""
         engine = _get_engine_no_init()
-        engine._closed_frames = 20  # > 10 frames closed
+        engine._closed_frames = 20
         engine._blink_count = 0
 
-        # Eyes re-open
         blink_detected = False
         if 1 <= engine._closed_frames <= 10:
             engine._blink_count += 1
@@ -228,11 +228,11 @@ class TestMouthAndSmile:
     def _build_face_expression(self, mouth_open: bool, smile: bool, eyebrows_raised: bool):
         lms = [_make_lm(0.5, 0.5) for _ in range(478)]
 
-        # Face bounds: top (10), bot (152), left (234), right (454)
+        # Face bounds
         lms[10]  = _make_lm(0.5, 0.10)
-        lms[152] = _make_lm(0.5, 0.90)  # Face height = 0.80
+        lms[152] = _make_lm(0.5, 0.90)
         lms[234] = _make_lm(0.20, 0.50)
-        lms[454] = _make_lm(0.80, 0.50)  # Face width = 0.60
+        lms[454] = _make_lm(0.80, 0.50)
 
         # Mouth corners (61, 291), Top lip (13), Bot lip (14)
         m_width = 0.30 if smile else 0.20
@@ -243,7 +243,6 @@ class TestMouthAndSmile:
         lms[13] = _make_lm(0.50, 0.70 - m_gap / 2.0)
         lms[14] = _make_lm(0.50, 0.70 + m_gap / 2.0)
 
-        # Eyebrows (105, 334) and Eyes (159, 386)
         brow_y = 0.28 if eyebrows_raised else 0.35
         lms[105] = _make_lm(0.35, brow_y)
         lms[159] = _make_lm(0.35, 0.40)
@@ -305,7 +304,42 @@ class TestExpressionClassification:
 
 
 # ===========================================================================
-# 6. VisionResult Structure Tests
+# 6. YuNet Face Detector Tests (Task 13 requirements)
+# ===========================================================================
+
+class TestYuNetFaceDetector:
+
+    @pytest.fixture(scope="class")
+    def engine(self):
+        from src.vision.vision_engine import VisionEngine
+        return VisionEngine()
+
+    def test_yunet_initialization(self, engine):
+        assert engine._yunet_detector is not None, "YuNet FaceDetectorYN should be initialized"
+
+    def test_yunet_blank_frame_no_face(self, engine):
+        img = np.ones((480, 640, 3), dtype=np.uint8) * 128
+        res = engine._detect_faces_yunet(img, img)
+        assert res["detected"] is False, "Blank frame should detect 0 faces"
+        assert res["count"] == 0
+        assert res["bounding_boxes"] == []
+        assert res["confidences"] == []
+        assert res["keypoints"] == []
+
+    def test_yunet_invalid_frame(self, engine):
+        res = engine._detect_faces_yunet(None, None)
+        assert res["detected"] is False
+        assert res["count"] == 0
+
+    def test_yunet_result_keys(self, engine):
+        img = np.ones((480, 640, 3), dtype=np.uint8) * 100
+        res = engine._detect_faces_yunet(img, img)
+        for key in ("detected", "count", "bounding_boxes", "confidences", "keypoints", "center"):
+            assert key in res
+
+
+# ===========================================================================
+# 7. VisionResult Structure Tests
 # ===========================================================================
 
 class TestVisionResultStructure:
@@ -320,13 +354,10 @@ class TestVisionResultStructure:
         assert isinstance(vr.right_hand, HandResult)
         assert isinstance(vr.pose, PoseResult)
 
-        # Eye fields
-        assert hasattr(vr.eyes, "left_open")
-        assert hasattr(vr.eyes, "right_open")
-        assert hasattr(vr.eyes, "blink_detected")
-        assert hasattr(vr.eyes, "blink_count")
-
-        # Face fields
+        # YuNet & Face fields
+        assert hasattr(vr.face, "keypoints")
+        assert hasattr(vr.face, "confidence")
+        assert hasattr(vr.face, "detector_source")
         assert hasattr(vr.face, "mouth_open")
         assert hasattr(vr.face, "smile")
         assert hasattr(vr.face, "eyebrows_raised")
@@ -334,7 +365,7 @@ class TestVisionResultStructure:
 
 
 # ===========================================================================
-# 7. VisionEngine Execution Tests
+# 8. VisionEngine Execution Tests
 # ===========================================================================
 
 class TestVisionEngineExecution:

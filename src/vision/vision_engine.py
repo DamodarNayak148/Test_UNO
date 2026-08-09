@@ -7,7 +7,10 @@ Runs all detectors on every camera frame and returns:
 
 Detector pipeline (each isolated -- one crash never halts the others):
   1. Brightness guard         -- dark/covered-camera early exit
-  2. MediaPipe FaceLandmarker -- 478-landmark face mesh + iris centres
+  2. Face Detector (YuNet + MediaPipe):
+     + YuNet (cv2.FaceDetectorYN) deep ONNX face detector for high accuracy,
+       zero background false-positives, confidence scores, and 5 keypoints
+     + MediaPipe FaceLandmarker for 478-landmark face mesh + iris centres
      + Eye Aspect Ratio (EAR) open/closed detection
      + State-machine Blink detection
      + Facial configuration & expression recognition (Smile, Mouth Open, Eyebrows)
@@ -80,8 +83,14 @@ _FINGER_MCPS = [2, 5,  9, 13, 17]
 _FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
 
 # ---------------------------------------------------------------------------
-# MediaPipe model URLs and local cache paths
+# Model URLs and local cache paths
 # ---------------------------------------------------------------------------
+_YUNET_MODEL_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+_YUNET_MODEL_PATH = "models/face_detection_yunet_2023mar.onnx"
+
 _POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
@@ -146,7 +155,6 @@ _FACE_RIGHT_IRIS_IDX = 473
 _FACE_NOSE_TIP_IDX   = 4
 
 # Eye Aspect Ratio (EAR) 6-point landmark indices
-# Left eye (person's left / camera right)
 _EAR_LEFT_CORNER1 = 362
 _EAR_LEFT_CORNER2 = 263
 _EAR_LEFT_TOP1    = 385
@@ -154,7 +162,6 @@ _EAR_LEFT_BOT1    = 380
 _EAR_LEFT_TOP2    = 387
 _EAR_LEFT_BOT2    = 373
 
-# Right eye (person's right / camera left)
 _EAR_RIGHT_CORNER1 = 33
 _EAR_RIGHT_CORNER2 = 133
 _EAR_RIGHT_TOP1    = 160
@@ -184,9 +191,6 @@ _FACE_R_SIDE  = 454
 class DetectionHistory:
     """
     Rolling-window boolean smoother for detector on/off flickering.
-
-    A detector is considered "active" only when it has fired in at least
-    `min_hits` of the last `window` frames.
     """
 
     def __init__(self, window: int = 5, min_hits: int = 2) -> None:
@@ -243,12 +247,16 @@ class VisionEngine:
         # ---- Blink state machine tracking ----
         self._blink_count: int = 0
         self._closed_frames: int = 0
-        self._blink_active_frames: int = 0  # Hold blink_detected True for 2 frames so UI/user can see it
+        self._blink_active_frames: int = 0
 
         # ---- Detector state ----
         self._mp: Any = None
 
-        # Haar (kept, loaded, but NOT called in process_frame)
+        # YuNet ONNX Face Detector (Primary detection engine)
+        self._yunet_detector: Any = None
+        self._init_yunet()
+
+        # Haar (kept loaded as standby fallback)
         self._face_cascade: Optional[cv2.CascadeClassifier] = None
         self._eye_cascade:  Optional[cv2.CascadeClassifier] = None
         self._init_haar()
@@ -266,6 +274,38 @@ class VisionEngine:
     # Initialisation helpers
     # ------------------------------------------------------------------
 
+    def _init_yunet(self) -> None:
+        """
+        Initialise YuNet face detector (cv2.FaceDetectorYN).
+        YuNet is a lightweight deep learning ONNX face detector from OpenCV Zoo.
+        Provides high-accuracy multi-face detection, bounding boxes, score thresholds,
+        NMS duplicate filtering, and 5 2D keypoints (eyes, nose, mouth corners).
+        """
+        if not hasattr(cv2, "FaceDetectorYN"):
+            print("[VisionEngine] cv2.FaceDetectorYN not available.")
+            return
+        try:
+            # Use project-relative path so running from any CWD works cleanly
+            model_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", _YUNET_MODEL_PATH)
+            )
+            if not os.path.exists(model_path):
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                print(f"[VisionEngine] Downloading YuNet model -> {model_path} ...")
+                urllib.request.urlretrieve(_YUNET_MODEL_URL, model_path)
+
+            self._yunet_detector = cv2.FaceDetectorYN.create(
+                model=model_path,
+                config="",
+                input_size=(640, 480),
+                score_threshold=0.6,
+                nms_threshold=0.3,
+                top_k=5000,
+            )
+            print("[VisionEngine] YuNet face detector initialized.")
+        except Exception as e:
+            print(f"[VisionEngine] YuNet init warning: {e}")
+
     def _init_haar(self) -> None:
         """Load Haar cascades (kept as fallback; not active in main loop)."""
         try:
@@ -282,7 +322,7 @@ class VisionEngine:
             print(f"[VisionEngine] Haar init warning: {e}")
 
     def _init_mediapipe(self) -> None:
-        """Import MediaPipe and initialise all three Tasks API detectors."""
+        """Import MediaPipe and initialise Tasks API detectors."""
         try:
             import sys
             import mediapipe as mp
@@ -316,11 +356,7 @@ class VisionEngine:
             traceback.print_exc()
 
     def _init_face_landmarker(self, mp: Any) -> None:
-        """
-        Initialise MediaPipe FaceLandmarker (Tasks API).
-        Provides 478-landmark attention-mesh including iris landmarks 468/473.
-        This replaces the Haar face cascade in the active detection path.
-        """
+        """Initialise MediaPipe FaceLandmarker (Tasks API) for 478-landmark mesh."""
         if not hasattr(mp, "tasks"):
             print("[VisionEngine] FaceLandmarker: Tasks API not available.")
             return
@@ -505,23 +541,120 @@ class VisionEngine:
         return annotated, result
 
     # ------------------------------------------------------------------
-    # Detector 1: MediaPipe FaceLandmarker + Eye/Blink/Expression Analysis
+    # YuNet Face Detector (cv2.FaceDetectorYN)
+    # ------------------------------------------------------------------
+
+    def _detect_faces_yunet(
+        self, annotated: np.ndarray, original: np.ndarray
+    ) -> Dict[str, Any]:
+        """
+        Run YuNet deep learning face detector (cv2.FaceDetectorYN).
+        Returns dict with detected, count, bounding_boxes, confidences, keypoints, center.
+        """
+        if self._yunet_detector is None:
+            return {"detected": False, "count": 0, "bounding_boxes": [], "confidences": [], "keypoints": [], "center": (0,0)}
+
+        try:
+            h, w = original.shape[:2]
+            self._yunet_detector.setInputSize((w, h))
+            _, faces = self._yunet_detector.detect(original)
+
+            if faces is None or len(faces) == 0:
+                return {"detected": False, "count": 0, "bounding_boxes": [], "confidences": [], "keypoints": [], "center": (0,0)}
+
+            boxes = []
+            confidences = []
+            all_keypoints = []
+
+            for f in faces:
+                bx, by, bw, bh = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                boxes.append((bx, by, bw, bh))
+                score = float(f[14])
+                confidences.append(score)
+
+                kpts = [
+                    (int(f[4]),  int(f[5])),   # Right eye
+                    (int(f[6]),  int(f[7])),   # Left eye
+                    (int(f[8]),  int(f[9])),   # Nose tip
+                    (int(f[10]), int(f[11])),  # Right mouth corner
+                    (int(f[12]), int(f[13])),  # Left mouth corner
+                ]
+                all_keypoints.append(kpts)
+
+                # Draw YuNet bounding box & keypoints on annotated frame
+                is_primary = (bx, by, bw, bh) == boxes[0]
+                col = _COL_FACE_BOX if is_primary else (80, 180, 80)
+                cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), col, 2)
+
+                # Draw 5 YuNet keypoint dots (cyan/yellow)
+                for kp in kpts:
+                    cv2.circle(annotated, kp, 3, (255, 255, 0), -1)
+
+                cv2.putText(
+                    annotated, f"YuNet {int(score*100)}%",
+                    (bx, max(12, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1,
+                )
+
+            primary_box = boxes[0]
+            cx = primary_box[0] + primary_box[2] // 2
+            cy = primary_box[1] + primary_box[3] // 2
+
+            return {
+                "detected": True,
+                "count": len(boxes),
+                "bounding_boxes": boxes,
+                "confidences": confidences,
+                "keypoints": all_keypoints[0] if all_keypoints else [],
+                "center": (cx, cy),
+            }
+        except Exception as e:
+            print(f"[VisionEngine] YuNet face detect error: {e}")
+            return {"detected": False, "count": 0, "bounding_boxes": [], "confidences": [], "keypoints": [], "center": (0,0)}
+
+    # ------------------------------------------------------------------
+    # Multi-Stage Face perception pipeline (YuNet + MediaPipe Landmarker)
     # ------------------------------------------------------------------
 
     def _detect_faces_mp(
         self, annotated: np.ndarray, original: np.ndarray
     ) -> Tuple[FaceResult, EyeResult]:
         """
-        Run MediaPipe FaceLandmarker.
-        Returns (FaceResult, EyeResult) derived from the face mesh.
+        Multi-stage face perception pipeline:
+          1. YuNet (cv2.FaceDetectorYN) for high-accuracy bounding boxes, scores, and 5 keypoints.
+          2. MediaPipe FaceLandmarker for 478 3D landmarks, EAR, MAR, smile, eyebrows, expression.
+          3. Haar cascade fallback if neither neural detector is available.
         """
+        yn_res = self._detect_faces_yunet(annotated, original)
+
         if self._face_landmarker is not None:
-            return self._detect_faces_landmarker(annotated, original)
+            face_res, eye_res = self._detect_faces_landmarker(annotated, original)
+            if yn_res["detected"]:
+                face_res.detected = True
+                face_res.count = yn_res["count"]
+                face_res.bounding_boxes = yn_res["bounding_boxes"]
+                face_res.center = yn_res["center"]
+                face_res.keypoints = yn_res["keypoints"]
+                face_res.confidence = yn_res["confidences"][0] if yn_res["confidences"] else 1.0
+                face_res.detector_source = "YuNet"
+            return face_res, eye_res
+
+        if yn_res["detected"]:
+            return FaceResult(
+                detected=True,
+                count=yn_res["count"],
+                bounding_boxes=yn_res["bounding_boxes"],
+                center=yn_res["center"],
+                confidence=yn_res["confidences"][0] if yn_res["confidences"] else 0.9,
+                keypoints=yn_res["keypoints"],
+                nose_tip=yn_res["keypoints"][2] if len(yn_res["keypoints"]) > 2 else None,
+                detector_source="YuNet",
+            ), EyeResult(blink_count=self._blink_count)
 
         if self._face_cascade is not None:
-            return self._detect_faces_haar(annotated), EyeResult()
+            return self._detect_faces_haar(annotated), EyeResult(blink_count=self._blink_count)
 
-        return FaceResult(), EyeResult()
+        return FaceResult(), EyeResult(blink_count=self._blink_count)
 
     def _detect_faces_landmarker(
         self, annotated: np.ndarray, original: np.ndarray
@@ -536,7 +669,6 @@ class VisionEngine:
             result = self._face_landmarker.detect(mp_img)
 
             if not result or not result.face_landmarks:
-                # Reset closed frames on no face detected
                 self._closed_frames = 0
                 return FaceResult(), EyeResult(blink_count=self._blink_count)
 
@@ -546,7 +678,6 @@ class VisionEngine:
                     (int(lm.x * w), int(lm.y * h)) for lm in face_lms
                 ]
 
-                # Bounding box from landmark extents
                 xs = [p[0] for p in pixels]
                 ys = [p[1] for p in pixels]
                 x_min, x_max = min(xs), max(xs)
@@ -557,7 +688,6 @@ class VisionEngine:
                 right_iris = pixels[_FACE_RIGHT_IRIS_IDX] if _FACE_RIGHT_IRIS_IDX < len(pixels) else None
                 nose_tip   = pixels[_FACE_NOSE_TIP_IDX]   if _FACE_NOSE_TIP_IDX   < len(pixels) else None
 
-                # Compute EAR (Eye Aspect Ratio) for Left & Right eyes
                 left_ear  = self._compute_ear(face_lms, _EAR_LEFT_CORNER1, _EAR_LEFT_CORNER2,
                                              _EAR_LEFT_TOP1, _EAR_LEFT_BOT1, _EAR_LEFT_TOP2, _EAR_LEFT_BOT2)
                 right_ear = self._compute_ear(face_lms, _EAR_RIGHT_CORNER1, _EAR_RIGHT_CORNER2,
@@ -566,13 +696,11 @@ class VisionEngine:
                 left_open  = left_ear > 0.20
                 right_open = right_ear > 0.20
 
-                # Compute MAR (Mouth Aspect Ratio), Smile, Eyebrows & Expression
                 mouth_ar, mouth_open = self._compute_mouth(face_lms)
                 smile = self._compute_smile(face_lms, mouth_ar)
                 eyebrows_raised, eyebrow_ratio = self._compute_eyebrows(face_lms)
                 expression = self._classify_expression(face_lms, smile, mouth_open, eyebrows_raised, eyebrow_ratio)
 
-                # Draw face mesh contours and expression overlay
                 self._draw_face_mesh(annotated, pixels, face_idx == 0, expression, left_open, right_open)
 
                 face_data.append({
@@ -601,7 +729,6 @@ class VisionEngine:
             cx = bx + bw // 2
             cy = by + bh // 2
 
-            # --- Blink State Machine ---
             left_open  = primary["left_open"]
             right_open = primary["right_open"]
             both_closed = (not left_open) and (not right_open)
@@ -610,10 +737,9 @@ class VisionEngine:
             if both_closed:
                 self._closed_frames += 1
             else:
-                # If eyes just re-opened after 1..10 closed frames, count a blink!
                 if 1 <= self._closed_frames <= 10:
                     self._blink_count += 1
-                    self._blink_active_frames = 3  # Display blink_detected=True for 3 frames
+                    self._blink_active_frames = 3
                 self._closed_frames = 0
 
             if self._blink_active_frames > 0:
@@ -636,6 +762,7 @@ class VisionEngine:
                 smile=primary["smile"],
                 eyebrows_raised=primary["eyebrows_raised"],
                 expression=primary["expression"],
+                detector_source="MediaPipe",
             )
 
             pxs = primary["pixels"]
@@ -725,10 +852,9 @@ class VisionEngine:
                 return False
             width_ratio = m_width / f_width
 
-            # Elevation of mouth corners relative to upper lip
             top_lip = landmarks[_MOUTH_TOP]
             avg_corner_y = (m_left.y + m_right.y) / 2.0
-            corner_lift = top_lip.y - avg_corner_y  # positive if corners pulled up
+            corner_lift = top_lip.y - avg_corner_y
 
             return bool(width_ratio > 0.43 or (width_ratio > 0.40 and mouth_ar > 0.15) or corner_lift > 0.008)
         except Exception:
@@ -773,7 +899,6 @@ class VisionEngine:
             if eyebrow_ratio > 0.0 and eyebrow_ratio < 0.042 and not mouth_open:
                 return "ANGRY"
 
-            # Check sad (corners pulled below lower lip)
             m_left, m_right = landmarks[_MOUTH_LEFT], landmarks[_MOUTH_RIGHT]
             bot_lip = landmarks[_MOUTH_BOT]
             if (m_left.y + m_right.y) / 2.0 > bot_lip.y + 0.005:
@@ -815,19 +940,17 @@ class VisionEngine:
             _polyline(_FACE_NOSE, _COL_NOSE, 1)
             _polyline(_FACE_LIPS_OUT, _COL_LIPS, 1)
 
-            # Draw concise status badge above face
             xs = [p[0] for p in pixels]
             ys = [p[1] for p in pixels]
             x_min, y_min = min(xs), min(ys)
             eye_str = "Eyes:Open" if (left_open and right_open) else ("Blink" if not (left_open or right_open) else "1-Eye")
-            badge = f"Face | {expression} | {eye_str}"
+            badge = f"Mesh | {expression} | {eye_str}"
             cv2.putText(
                 annotated, badge,
                 (max(10, x_min), max(20, y_min - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, _COL_FACE_BOX, 1,
             )
 
-        # Iris dots
         for iris_idx, eye_open in [(_FACE_LEFT_IRIS_IDX, left_open), (_FACE_RIGHT_IRIS_IDX, right_open)]:
             if iris_idx < n:
                 dot_col = _COL_EYE if eye_open else _COL_EYE_CLOSED
@@ -861,6 +984,7 @@ class VisionEngine:
                 bounding_boxes=boxes,
                 center=(cx, cy),
                 confidence=0.5,
+                detector_source="Haar",
             )
         except Exception as e:
             print(f"[VisionEngine] Haar face fallback error: {e}")
@@ -985,20 +1109,6 @@ class VisionEngine:
     ) -> List[bool]:
         """
         Determine which of the 5 fingers are extended using 3D vector geometry.
-
-        Algorithm:
-          Fingers 1-4 (index through pinky):
-            1. Compute palm direction unit vector: wrist(0) -> middle_MCP(9)
-            2. Project (finger_MCP -> finger_TIP) onto palm direction.
-            3. If projection > threshold -> finger extended.
-            This works for any hand orientation (upright, sideways, inverted).
-
-          Thumb (0):
-            1. Distance from Thumb TIP (4) to Pinky MCP (17) relative to Palm Size (Wrist 0 -> Middle MCP 9).
-               When extended (open hand / thumbs up), ratio > 1.08.
-               When folded across palm (fist / 4 fingers / peace sign), ratio < 0.90.
-            2. IP joint straightness alignment: dot(CMC->MCP, IP->TIP) > 0.25.
-            3. Combined condition ensures thumb works when upright, rotated, or tilted!
         """
         states = [False] * 5
 
@@ -1011,7 +1121,6 @@ class VisionEngine:
             pinky_mcp  = landmarks[17]
             idx_mcp    = landmarks[5]
 
-            # Palm direction: wrist -> middle_MCP
             pdx = middle_mcp.x - wrist.x
             pdy = middle_mcp.y - wrist.y
             pdz = middle_mcp.z - wrist.z
@@ -1020,8 +1129,7 @@ class VisionEngine:
                 pd_len = 1.0
             palm_dir = (pdx / pd_len, pdy / pd_len, pdz / pd_len)
 
-            # Fingers 1-4: project MCP->TIP onto palm direction
-            finger_mcps = [5, 9, 13, 17]   # index, middle, ring, pinky
+            finger_mcps = [5, 9, 13, 17]
             finger_tips = [8, 12, 16, 20]
             threshold = 0.04 * pd_len
 
@@ -1040,7 +1148,6 @@ class VisionEngine:
             thumb_ip  = landmarks[3]
             thumb_tip = landmarks[4]
 
-            # 3D Distance from Thumb TIP (4) to Pinky MCP (17)
             d_tip_pinky = self._dist_3d(thumb_tip, pinky_mcp)
             d_tip_idx   = self._dist_3d(thumb_tip, idx_mcp)
             d_cmc_idx   = self._dist_3d(thumb_cmc, idx_mcp)
@@ -1048,7 +1155,6 @@ class VisionEngine:
             ratio_pinky = d_tip_pinky / pd_len
             ratio_idx   = d_tip_idx / pd_len
 
-            # IP joint straightness (CMC->MCP dot IP->TIP)
             v1 = (thumb_mcp.x - thumb_cmc.x, thumb_mcp.y - thumb_cmc.y, thumb_mcp.z - thumb_cmc.z)
             v2 = (thumb_tip.x - thumb_ip.x,   thumb_tip.y - thumb_ip.y,   thumb_tip.z - thumb_ip.z)
             v1_len = math.sqrt(v1[0]**2 + v1[1]**2 + v1[2]**2)
@@ -1058,8 +1164,6 @@ class VisionEngine:
             if v1_len > 1e-6 and v2_len > 1e-6:
                 dot_align = (v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]) / (v1_len * v2_len)
 
-            # Thumb is extended if it spreads away from palm (high ratio_pinky or high ratio_idx)
-            # AND the thumb joints are relatively uncurled.
             thumb_extended = (
                 (ratio_pinky > 1.08 and dot_align > 0.25) or
                 (ratio_idx > 0.85 and d_tip_idx > d_cmc_idx * 1.15)
@@ -1081,12 +1185,10 @@ class VisionEngine:
         label:         str,
     ) -> None:
         """Draw hand skeleton, joints, and per-finger-tip state indicators."""
-        # Connections
         for a, b in _HAND_CONNECTIONS:
             if a < len(pixels) and b < len(pixels):
                 cv2.line(annotated, pixels[a], pixels[b], colour, 2)
 
-        # Joints / tips
         for i, pt in enumerate(pixels):
             if i in _FINGER_TIPS:
                 fi = _FINGER_TIPS.index(i)
@@ -1096,7 +1198,6 @@ class VisionEngine:
             else:
                 cv2.circle(annotated, pt, 4, colour, -1)
 
-        # Label above wrist: "LH 3/5"
         if pixels:
             wx, wy = pixels[0]
             cv2.putText(
@@ -1147,7 +1248,6 @@ class VisionEngine:
 
             n = len(lms_raw)
 
-            # ---- Arm-raised detection ----
             left_hand_raised  = False
             right_hand_raised = False
 
@@ -1170,7 +1270,6 @@ class VisionEngine:
                         r_wrist.y < r_ear.y
                     )
 
-            # ---- Standing / sitting classification ----
             standing = False
             sitting  = False
 
